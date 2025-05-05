@@ -1,0 +1,47 @@
+#!/bin/bash
+
+#::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+#                     Slurm Construction Section
+#::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+# job name
+#SBATCH --job-name=docking
+
+# partition (queue) declaration
+#SBATCH --partition=dept_cpu
+
+# send email about job start and end
+##SBATCH --mail-type=ALL
+
+#::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+#                     User Construction Section
+#::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+# Find the first .txt file in the directory
+txt_file=$(ls | grep -i '\.txt' | head -n 1)
+
+# Check if a .txt file was found
+if [ -z "$txt_file" ]; then
+    echo "No .txt file found in the directory."
+    exit 1
+fi
+
+# Extract the base name without the extension
+base_name=$(basename "$txt_file" .txt)
+
+# Construct the new file names
+config_file="${base_name}.txt"
+log_file="${base_name}.log"
+
+# echo $config_file
+# echo $log_file
+
+# Run Vina with the configuration file and direct output to the log file
+vina --config "$config_file" > "$log_file"
+
+# Append date and time of finished job in a file
+date >> date.txt
+
+# Leave this line to tell slurm that the script finished correctly
+exit 0 
+ 
