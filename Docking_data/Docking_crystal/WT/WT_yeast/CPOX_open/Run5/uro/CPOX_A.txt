@@ -1,0 +1,21 @@
+receptor = CPOX_open.pdbqt
+ligand = UroporphyrinI.pdbqt
+
+
+out = CPOX_open_uro.pdbqt
+
+center_x = 42.057
+center_y = 13.657
+center_z = 47.431
+
+size_x = 48
+size_y = 38
+size_z = 56
+
+exhaustiveness = 50
+
+num_modes = 100
+
+cpu = 2
+
+log = CPOX_A.dlg
