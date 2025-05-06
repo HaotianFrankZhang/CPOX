@@ -18,7 +18,7 @@ This folder contains scripts and Jupyter notebooks used for the analysis of mole
 
 ---
 
-## 🔹 FPocket/
+## 🔹 FPocket
 
 **Purpose:** Identify and evaluate ligand-binding pockets across MD snapshots and CPOX variants using [fpocket](https://github.com/Discngine/fpocket).
 
@@ -41,7 +41,7 @@ pip install prodigy-prot
 
 ---
 
-## 🔹 Hinge_analysis/
+## 🔹 Hinge_analysis
 
 **Purpose:** Identify global hinge sites—key pivot points involved in collective motions—using normal mode analysis.
 
@@ -59,7 +59,7 @@ Bahar I. et al., *Global hinge sites of proteins as target sites for drug bindin
 
 ---
 
-## 🔹 MD_analysis/
+## 🔹 MD_analysis
 
 **Purpose:** Analyze dynamics across AlphaFold-based and crystal-based MD simulations.
 
@@ -76,7 +76,7 @@ pip install MDAnalysis prody matplotlib pandas seaborn numpy
 
 ---
 
-## 🔹 PCA_analysis/
+## 🔹 PCA_analysis
 
 **Purpose:** Perform Principal Component Analysis (PCA) to evaluate dominant motions and compare conformational sampling.
 
@@ -92,7 +92,7 @@ pip install MDAnalysis prody matplotlib pandas seaborn numpy
 ```
 ---
 
-## 🔹 Docking_data/
+## 🔹 Docking_data
 
 **Purpose:** Evaluate docking results of two ligands—**coproporphyrinogen III** and **uroporphyrinogen III**—to CPOX structures derived from AlphaFold and crystal models.
 
