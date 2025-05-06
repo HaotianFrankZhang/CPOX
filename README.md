@@ -90,6 +90,39 @@ pip install MDAnalysis prody matplotlib pandas seaborn numpy
 ```bash
 pip install MDAnalysis prody matplotlib pandas seaborn numpy
 ```
+---
+
+## 🔹 Docking_data/
+
+**Purpose:** Evaluate docking results of two ligands—**coproporphyrinogen III** and **uroporphyrinogen III**—to CPOX structures derived from AlphaFold and crystal models.
+
+### Structure:
+- `UroprophyrinogenIII.pdbqt`, `CoproporphyrinogenIII.pdbqt`: Ligand structures used for docking.
+- `Vina_job`: Shell script or command file used to run AutoDock Vina docking jobs.
+
+### Subfolders:
+- `Docking_AF/`: Docking results for AlphaFold-based structures.
+- `Docking_crystal/`: Docking results for crystal-based structures.
+
+Each of these contains five mutation subfolders:
+- `WT/`, `G188Q/`, `N272H/`, `V135A/`, `L155W/`
+
+Each mutation folder contains docking outputs for MD snapshots (multiple frames). For each docking snapshot:
+- One `.pdbqt` file corresponds to the protein structure used in that docking instance.
+- Five subfolders: `Run1/` through `Run5/`
+
+Each `RunX/` contains:
+- `copro/` and `uro/`: Results for **coproporphyrinogen III** and **uroporphyrinogen III**, respectively.
+
+Inside each ligand folder:
+- `CPOX_A.txt`: Docking parameters used.
+- `CPOX_A.log`, `CPOX_A.dlg`: AutoDock Vina docking log files with binding scores and modes.
+- `.pdbqt`: Output docking conformations of the ligand.
+- `.pse`: PyMOL session file for visualizing docking pose (if available).
+
+### Dependencies:
+- Requires [AutoDock Vina](http://vina.scripps.edu/)
+- Optional: [PyMOL](https://pymol.org/) for visualization of `.pse` files.
 
 ---
 
