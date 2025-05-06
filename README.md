@@ -13,16 +13,7 @@ This folder contains scripts and Jupyter notebooks used for the analysis of mole
 
 ## 📦 Required Packages
 
-To run the notebooks in this folder, the following Python packages are required:
+To run the notebooks in this folder, you will need the following Python packages:
 
 ```bash
-python>=3.8
-numpy
-pandas
-matplotlib
-mdtraj
-mdanalysis
-
-## You can install all required packages using
-
 pip install numpy pandas matplotlib mdtraj mdanalysis
