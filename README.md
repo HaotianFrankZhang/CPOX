@@ -269,7 +269,7 @@ MD snapshots were recorded every 100 ps during each simulation. ProDy was used t
 
 ## 📚 Citations
 
-* **PRODIGY**: https://github.com/haddocking/prodigy
+* **PRODIGY**: [https://github.com/haddocking/prodigy](https://github.com/haddocking/prodigy-lig)
 * **fpocket**: https://github.com/Discngine/fpocket
 * **AutoDock Vina**: http://vina.scripps.edu/
 * **Hinge site analysis**: Haotian Z. et al., *Global hinge sites of proteins as target sites for drug binding*
