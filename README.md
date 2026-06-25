@@ -95,13 +95,11 @@ devtools::install_github("jweile/yogiroc")
 
 ```bash
 pip install MDAnalysis
-pip install prodigy
 ```
 
 Additional requirements:
 
 * [fpocket](https://github.com/Discngine/fpocket) binary
-* [PRODIGY](https://github.com/haddocking/prodigy) for optional pocket affinity prediction
 
 ---
 
@@ -240,10 +238,13 @@ Binding affinity was estimated using PRODIGY-LIG on ligand-bound MD trajectory f
 
 * PRODIGY-LIG
 * Python packages commonly used in the MD analysis workflow, including:
-
 ```bash
 pip install MDAnalysis pandas numpy openpyxl
 ```
+
+Additional requirements:
+
+* [PRODIGY](https://github.com/haddocking/prodigy) for optional pocket affinity prediction
 
 ---
 
