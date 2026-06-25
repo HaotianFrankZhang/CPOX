@@ -95,7 +95,7 @@ devtools::install_github("jweile/yogiroc")
 
 ```bash
 pip install MDAnalysis
-pip install prodigy-prot
+pip install prodigy
 ```
 
 Additional requirements:
@@ -121,7 +121,7 @@ pip install prody numpy matplotlib
 ```
 
 **Citation:**
-Bahar I. et al., *Global hinge sites of proteins as target sites for drug binding*
+Zhang H. et al., *Global hinge sites of proteins as target sites for drug binding*
 
 ---
 
@@ -150,7 +150,7 @@ pip install MDAnalysis prody matplotlib pandas seaborn numpy
 
 ## 🔹 PCA_analysis
 
-**Purpose:** Perform principal component analysis (PCA) to evaluate dominant protein motions and compare conformational sampling across CPOX variants and structural models.
+**Purpose:** Perform principal component analysis (PCA) to evaluate dominant protein motions and compare conformational sampling across CPOX variants and structural models. Prior to PCA, MD snapshots were structurally aligned using ProDy’s iterative superposition (iterpose) procedure, allowing WT and variant trajectories to be projected and compared within a common principal component space.
 
 ### Files:
 
@@ -220,7 +220,7 @@ Inside each ligand folder:
 
 ### Method Summary:
 
-Binding affinity was estimated using PRODIGY-LIG on MD frames. For each ligand, the ligand was scored against either chain A or chain B depending on the docking orientation. For each system, the chain consistent with the docking pose was reported. When applicable, chain A and chain B results were collapsed per frame by selecting the more favorable ΔG value, yielding a single ΔG(t) time series for downstream analysis.
+Binding affinity was estimated using PRODIGY-LIG on ligand-bound MD trajectory frames. For each system, the ligand-bound chain and binding pose were selected from the AutoDock Vina docking results based on the consensus between the most favorable docking score and the highest active-site pocket occupancy. The selected docking-defined chain was then used consistently for PRODIGY-LIG analysis, generating a single time-dependent binding free energy profile, ΔG(t), for downstream analysis.
 
 ### Files & Steps:
 
