@@ -32,7 +32,7 @@ This repository contains the necessary notebooks, scripts, processed datasets, a
 
 * `Manuscript_Data.xlsx`: A single Excel workbook containing processed data and supplementary resources supporting the manuscript. This includes variant effect map scores under baseline and mercury-treated conditions, delta scores, log likelihood ratios of pathogenicity, a curated clinical reference set, in silico predictions including AlphaMissense, ΔΔG, and SASA, enzymatic activity measurements, and oligonucleotide sequences used for mutagenesis and sequencing.
 
-* `CPOX_Manuscript_Rcode_v3.Rmd`: R Markdown file used to generate nearly all figures related to the variant effect map scores in the manuscript.
+* `CPOX_Manuscript_Rcode_v3.Rmd`, `CPOX_Manuscript_Rcode_v4.Rmd`: R Markdown file used to generate nearly all figures related to the variant effect map scores in the manuscript.
 
 ### Dependencies:
 
