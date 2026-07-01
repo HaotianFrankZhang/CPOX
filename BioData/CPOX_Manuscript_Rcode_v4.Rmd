@@ -1,0 +1,3222 @@
+---
+title: "CPOX_Manuscript"
+date: "2026-4-7"
+editor_options: 
+  chunk_output_type: inline
+---
+
+# =============================================================================
+# CPOX Deep Mutational Scanning (DMS) Analysis — Manuscript Code
+#
+# This R Markdown document contains all analyses for the CPOX DMS manuscript.
+# CPOX (coproporphyrinogen oxidase) is the enzyme deficient in hereditary
+# coproporphyria (HCP). The experiment measures variant functional scores
+# under two conditions:
+#   • Baseline  — standard growth selection
+#   • Metal     — growth selection in the presence of mercury (Hg)
+#
+# Chunks covered:
+#   1.  Score Distributions
+#   2.  Consensus ring map (circular visualisation)
+#   3.  Population-level assessment (UK Biobank / gnomAD)
+#   4.  Baseline vs. Metal map correlation
+#   5.  Delta score analysis (baseline – metal)
+#   6.  Functional scores vs. predicted ΔΔG (thermodynamic stability)
+#   7.  Correlation with patient enzymatic activity
+#   8.  Hypercomplementing variants vs. AlphaMissense
+#   9.  Dunham 33-map substitution trend comparison
+#   10. Amino acid substitution type analysis (FROM / TO)
+#   11. Structure-based analysis (SASA / quaternary domains)
+#   12. MTS-region structure analysis
+#   13. Negative-charge substitution at second decarboxylation residues
+#   14. Delta score impact classification (APR / Improved / Known)
+#   15. Delta significance heatmap
+#   16. Balanced Precision-Recall Curves (PRC)
+#   17. PRC with random predictor
+#   18. LLRp evidence for VUS reclassification
+#   19. VUS reclassification summary
+#   20. Variant validation (growth curves)
+# =============================================================================
+
+
+```{r, warning=FALSE, Libraries}
+# Load all libraries used across the manuscript analyses
+library(cowplot)
+library(data.table)
+library(ggnewscale)    
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(ggsignif)
+library(ggnewscale)
+library(gridExtra)
+library(googlesheets4)
+library(httr)          
+library(jsonlite)     
+library(mgsub)         
+library(patchwork)
+library(plotly)
+library(purrr)
+library(readxl)
+library(RcppRoll)
+library(rstatix)
+library(scales)
+library(stringr)
+library(tidyverse)
+library(RColorBrewer)
+library(reshape2)
+library(yogiroc)       
+library(readxl)       
+library(zoo)        
+
+```
+
+
+```{r, warning=FALSE, Data Loading Helper}
+# =============================================================================
+# HELPER — read_sheet()
+#
+# Reads a named sheet from Manuscript_Data.xlsx, skipping the first row
+# (generic info row), then coerces every column to numeric where possible.
+# Character columns (e.g. hgvs_pro, disease_type) are left as-is.
+# Use this instead of readxl::read_excel() directly throughout the script.
+# =============================================================================
+
+read_sheet <- function(sheet) {
+  df <- readxl::read_excel(
+    "~/Desktop/Manuscript_Data.xlsx",
+    sheet    = sheet,
+    skip     = 1,
+    na       = c("", "NA", "N/A", "#NAME?", "#VALUE!", "#REF!",
+                 "#DIV/0!", "#NULL!", "#NUM!", "#N/A")
+  )
+  df[] <- lapply(df, function(col) {
+    if (is.character(col)) {
+      # Map Excel Inf strings to R Inf, then coerce
+      col <- trimws(col)
+      col[col %in% c("Inf", "inf", "INF")]   <- "Inf"
+      col[col %in% c("-Inf", "-inf", "-INF")] <- "-Inf"
+      converted <- suppressWarnings(as.numeric(col))
+      # Keep as character only if conversion turned non-NA values into NA
+      non_na_orig      <- !is.na(col)
+      non_na_converted <- !is.na(converted)
+      if (all(non_na_converted[non_na_orig])) converted else col
+    } else {
+      col
+    }
+  })
+  as.data.frame(df)
+}
+```
+
+
+```{r, warning=FALSE, Score Distributions}
+# =============================================================================
+# CHUNK 1 — Score Distributions
+#
+# Produces mirrored bar-density histograms for each map (Baseline, Metal).
+# Missense density is plotted below zero; nonsense and synonymous above.
+# Also reports:
+#   • Median score per variant class
+#   • Percentage of missense variants with score > 1.1 (hyperactive candidates)
+# =============================================================================
+
+process_maps <- function(baseline_path = NULL, metal_path = NULL) {
+  
+  # Inner helper: classify variants, bin into histogram, return plot data
+  prepare_plot_data <- function(data, context, score_column = "score") {
+    
+    # Classify by HGVS notation suffix
+    stop.is <- which(grepl("Ter$", data$hgvs_pro))   # nonsense: ends with 'Ter'
+    syn.is  <- which(grepl("=$", data$hgvs_pro))      # synonymous: ends with '='
+    miss.is <- setdiff(1:nrow(data), c(stop.is, syn.is))  # everything else = missense
+    
+    stp  <- na.omit(data[stop.is, score_column])
+    syn  <- na.omit(data[syn.is, score_column])
+    miss <- na.omit(data[miss.is, score_column])
+    
+    # Fraction of missense variants above 1.1 (potential gain-of-function)
+    percent_miss_gt_1.1 <- if (length(miss) > 0) {
+      sum(miss > 1.1) / length(miss) * 100
+    } else { NA }
+    
+    medians <- data.frame(
+      type = c("nonsense", "synonymous", "missense"),
+      median = c(median(stp), median(syn), median(miss)),
+      context = context
+    )
+    
+    # Bin scores into fixed-width histogram bins (-2 to 2.5, width 0.1)
+    stp_hist  <- hist(stp,  breaks = seq(-2, 2.5, 0.1), plot = FALSE)
+    syn_hist  <- hist(syn,  breaks = seq(-2, 2.5, 0.1), plot = FALSE)
+    miss_hist <- hist(miss, breaks = seq(-2, 2.5, 0.1), plot = FALSE)
+    
+    # Negate missense density for mirrored plot
+    stp_df  <- data.frame(bin = stp_hist$mids,  density = stp_hist$density,  type = "nonsense")
+    syn_df  <- data.frame(bin = syn_hist$mids,  density = syn_hist$density,  type = "synonymous")
+    miss_df <- data.frame(bin = miss_hist$mids, density = -miss_hist$density, type = "missense")
+    
+    combined <- rbind(stp_df, syn_df, miss_df)
+    combined$context <- context
+    list(plot_data = combined, medians = medians, percent_miss_gt_1.1 = percent_miss_gt_1.1)
+  }
+  
+  data_list    <- list()
+  medians_list <- list()
+  percentages  <- list()
+  contexts     <- c("Baseline", "Metal")
+  
+  if (!is.null(baseline_path)) {
+    baseline_map <- read_sheet("Baseline Map")
+    baseline_results <- prepare_plot_data(baseline_map, "Baseline")
+    data_list[["Baseline"]]   <- baseline_results$plot_data
+    medians_list[["Baseline"]] <- baseline_results$medians
+    percentages[["Baseline"]]  <- baseline_results$percent_miss_gt_1.1
+  }
+  
+  if (!is.null(metal_path)) {
+    metal_map <- read_sheet("Mercury Map")
+    metal_results <- prepare_plot_data(metal_map, "Metal")
+    data_list[["Metal"]]   <- metal_results$plot_data
+    medians_list[["Metal"]] <- metal_results$medians
+    percentages[["Metal"]]  <- metal_results$percent_miss_gt_1.1
+  }
+  
+  print("Medians for each group:")
+  medians_df <- do.call(rbind, medians_list)
+  print(medians_df)
+  
+  print("Percentage of missense variants > 1.1:")
+  percentages_df <- data.frame(
+    context = names(percentages),
+    percent_miss_gt_1.1 = unlist(percentages)
+  )
+  print(percentages_df)
+  
+  # Plot and save a PDF for each condition
+  for (context in contexts) {
+    if (!is.null(data_list[[context]])) {
+      plot_data <- data_list[[context]]
+      p <- ggplot(plot_data, aes(x = bin, y = density, fill = type)) +
+        geom_bar(stat = "identity", position = "identity",
+                 width = 0.1, color = "black", alpha = 0.4) +
+        scale_fill_manual(values = c(
+          "nonsense"   = "#C9364E",
+          "synonymous" = "#003366",
+          "missense"   = "grey"
+        )) +
+        labs(
+          title = paste("Histogram of Variant Densities:", context),
+          x = "Functional Score",
+          y = "Density"
+        ) +
+        theme_minimal() +
+        theme(
+          axis.title = element_text(size = 14),
+          axis.text  = element_text(size = 12),
+          legend.position = "top"
+        )
+      print(p)
+      
+      filename <- paste0("~/Desktop/", context, "_Histogram.pdf")
+      ggsave(filename, plot = p, width = 8, height = 6)
+    }
+  }
+}
+
+process_maps(
+  baseline_path = "~/Desktop/Manuscript_Data.xlsx",
+  metal_path    = "~/Desktop/Manuscript_Data.xlsx"
+)
+```
+
+
+```{r, warning=FALSE, Consensus}
+# =============================================================================
+# CHUNK 2 — Consensus Circular Map
+#
+# Builds a polar (circular) visualisation of the full CPOX protein showing:
+#   • Outer ring   : Baseline consensus (fraction of variants per score class)
+#   • Middle ring  : Delta ring — shows variants that are APR (activity reduced
+#                    in presence of mercury) or Improved under metal exposure
+#   • Inner ring   : Metal map consensus
+#   • Lollipops    : Clinical reference variants (HCP/HP = purple, benign = green)
+#   • Secondary structure: helices (sine waves), strands (rectangles + arrowheads),
+#                    loops (lines) fetched live from UniProt
+#
+# Score class boundaries (LOF → GOF):
+#   lof1 ≤ 0.0 < lof3 ≤ 0.2 < lof4 ≤ 0.4 < lof5 ≤ 0.6 < lof6 ≤ 0.8
+#   wt   ≤ 1.2 < gof1 ≤ 1.4 < gof2 ≤ 1.6 < gof3 ≤ 1.8 < gof4 ≤ 2.0
+#   gof6  > 2.0
+# =============================================================================
+
+DATA_PATH <- "~/Desktop/Manuscript_Data.xlsx"
+
+UNIPROT_ID <- "P36551"
+
+class_levels <- c(
+  "lof1","lof3","lof4","lof5","lof6",
+  "wt",
+  "gof1","gof2","gof3","gof4","gof6"
+)
+
+color_map <- c(
+  lof1 = rgb(0.23, 0.37, 0.80),
+  lof3 = rgb(0.48, 0.58, 0.87),
+  lof4 = rgb(0.61, 0.69, 0.90),
+  lof5 = rgb(0.74, 0.79, 0.93),
+  lof6 = rgb(0.87, 0.89, 0.96),
+  wt   = rgb(1, 1, 1),
+  gof1 = rgb(0.96, 0.85, 0.85),
+  gof2 = rgb(0.93, 0.71, 0.71),
+  gof3 = rgb(0.90, 0.57, 0.57),
+  gof4 = rgb(0.87, 0.43, 0.43),
+  gof6 = rgb(0.80, 0.15, 0.15)
+)
+
+delta_colors <- c(
+  turquoise  = "#2ED1D1",
+  darkorange = "darkorange",
+  white      = "white"
+)
+
+# ── Radial geometry parameters ────────────────────────────────────────────
+ring_width        <- 0.45
+delta_ring_height <- 0.03
+ring_gap          <- 0.01
+
+metal_inner_radius    <- 0.40
+delta_inner_radius    <- metal_inner_radius + ring_width + ring_gap
+baseline_inner_radius <- delta_inner_radius + delta_ring_height + ring_gap
+structure_radius      <- baseline_inner_radius + ring_width + 0.15
+
+lollipop_distance    <- 0.01
+lollipop_height      <- 0.12
+lollipop_base_radius <- structure_radius + lollipop_distance
+
+gap_start <- 454
+gap_width <- 20
+gap_pos   <- (gap_start + 1):(gap_start + gap_width)
+
+# ── Fetch UniProt secondary structure annotation ──────────────────────────
+get_uniprot_secstruc <- function(uniprot_id) {
+  js <- fromJSON(content(
+    GET(paste0("https://rest.uniprot.org/uniprotkb/", uniprot_id, ".json")),
+    "text"
+  ))
+  
+  sec <- tibble(
+    pos      = 1:nchar(js$sequence$value),
+    secstruc = "other"
+  )
+  
+  for (i in seq_len(nrow(js$features))) {
+    f <- js$features[i, ]
+    if (f$type %in% c("Helix", "Beta strand")) {
+      s <- as.integer(f$location$start$value)
+      e <- as.integer(f$location$end$value)
+      sec$secstruc[s:e] <- ifelse(f$type == "Helix", "helix", "strand")
+    }
+  }
+  sec
+}
+
+sec_df <- get_uniprot_secstruc(UNIPROT_ID)
+
+# ── Build consensus rings ─────────────────────────────────────────────────
+build_consensus <- function(path, sheet, r_inner, r_height, flip = FALSE) {
+  df <- read_excel(path, sheet = sheet, skip = 1) %>%
+    mutate(pos = as.integer(str_extract(hgvs_pro, "\\d+"))) %>%
+    filter(!is.na(pos), !is.na(score)) %>%
+    mutate(class = case_when(
+      score <= 0.0 ~ "lof1", score <= 0.2 ~ "lof3", score <= 0.4 ~ "lof4",
+      score <= 0.6 ~ "lof5", score <= 0.8 ~ "lof6", score <= 1.2 ~ "wt",
+      score <= 1.4 ~ "gof1", score <= 1.6 ~ "gof2", score <= 1.8 ~ "gof3",
+      score <= 2.0 ~ "gof4", TRUE ~ "gof6"
+    ))
+  
+  out <- df %>%
+    count(pos, class, name = "n") %>%
+    mutate(class = factor(class, levels = class_levels)) %>%
+    arrange(pos, class) %>%
+    group_by(pos) %>%
+    mutate(
+      frac = n / sum(n),
+      ymin = if (!flip) r_inner + lag(cumsum(frac), default = 0) * r_height
+      else r_inner + r_height - cumsum(frac) * r_height,
+      ymax = if (!flip) r_inner + cumsum(frac) * r_height
+      else r_inner + r_height - lag(cumsum(frac), default = 0) * r_height
+    ) %>%
+    ungroup()
+  
+  bind_rows(
+    out,
+    tibble(
+      pos   = gap_pos,
+      class = factor(NA, levels = class_levels),
+      ymin  = r_inner,
+      ymax  = r_inner + r_height
+    )
+  )
+}
+
+# ── Build delta ring ──────────────────────────────────────────────────────
+build_delta_ring <- function(delta_path, delta_sheet, baseline_path, baseline_sheet, r_inner, r_height) {
+  
+  delta <- read_excel(delta_path, sheet = delta_sheet, skip = 1) %>%
+    mutate(
+      deltaScore  = as.numeric(deltaScore),
+      deltaSE     = as.numeric(deltaSE),
+      pos         = as.integer(str_extract(hgvs_pro, "\\d+")),
+      significant = case_when(
+      significant == "TRUE"  ~ TRUE,
+      significant == "FALSE" ~ FALSE,
+      TRUE                   ~ NA
+)    ) %>%
+    filter(!is.na(pos), is.finite(deltaScore), is.finite(deltaSE), !is.na(significant))
+  setDT(delta)
+  
+  baseline_map <- read_excel(baseline_path, sheet = baseline_sheet, skip = 1)
+  setDT(baseline_map)
+  colnames(baseline_map)[1:4] <- c("hgvs_pro", "baseline_score", "se", "df")
+  
+  baseline_map[, baseline_lower := baseline_score + se]
+  baseline_stop <- grepl("Ter$", baseline_map$hgvs_pro)
+  baseline_syn  <- grepl("=$",   baseline_map$hgvs_pro)
+  baseline_miss <- !(baseline_stop | baseline_syn)
+  
+  baseline_miss_tolerated <- baseline_map[
+    baseline_miss & baseline_lower >= 0.5
+  ]
+  
+  delta[, Impact := "neutral"]
+  APR_set      <- delta[significant == TRUE  & deltaScore < 0 & hgvs_pro %in% baseline_miss_tolerated$hgvs_pro, hgvs_pro]
+  Improved_set <- delta[significant == TRUE  & deltaScore > 0 & hgvs_pro %in% baseline_miss_tolerated$hgvs_pro, hgvs_pro]
+  known_set    <- delta[significant == FALSE & hgvs_pro %in% baseline_miss_tolerated$hgvs_pro, hgvs_pro]
+  
+  delta[hgvs_pro %in% APR_set,      Impact := "APR"]
+  delta[hgvs_pro %in% Improved_set, Impact := "improved"]
+  delta[hgvs_pro %in% known_set,    Impact := "known"]
+  
+  delta_pos <- delta %>%
+    group_by(pos, Impact) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(pos) %>%
+    mutate(
+      max_n    = max(n),
+      n_at_max = sum(n == max_n)
+    ) %>%
+    slice_max(n, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(
+      delta_bin = case_when(
+        Impact == "APR"      & n_at_max == 1 ~ "turquoise",
+        Impact == "improved" & n_at_max == 1 ~ "darkorange",
+        TRUE                                 ~ "white"
+      ),
+      ymin = r_inner,
+      ymax = r_inner + r_height
+    ) %>%
+    select(pos, delta_bin, ymin, ymax)
+  
+  bind_rows(
+    delta_pos,
+    tibble(pos = gap_pos, delta_bin = "white", ymin = r_inner, ymax = r_inner + r_height)
+  )
+}
+
+# ── Secondary structure elements ──────────────────────────────────────────
+make_ss_elements <- function(sec_df, r) {
+  sec_df <- bind_rows(sec_df, tibble(pos = gap_pos, secstruc = "gap"))
+  helices <- strands <- arrowheads <- loops <- tibble()
+  
+  i <- 1
+  while (i <= nrow(sec_df)) {
+    t <- sec_df$secstruc[i]
+    s <- sec_df$pos[i]
+    while (i < nrow(sec_df) && sec_df$secstruc[i + 1] == t) i <- i + 1
+    e <- sec_df$pos[i]
+    
+    if (t == "helix") {
+      x <- seq(s, e, length.out = 80)
+      y <- r + 0.08 * sin(seq(0, 2 * pi, length.out = 80))
+      helices <- bind_rows(helices, tibble(x, y, group = s))
+    } else if (t == "strand") {
+      h <- 0.12
+      strands <- bind_rows(strands, tibble(
+        x = c(s, e, e, s), y = c(r - h/2, r - h/2, r + h/2, r + h/2), group = s
+      ))
+      arrowheads <- bind_rows(arrowheads, tibble(
+        x = c(e, e + 3, e), y = c(r - h/2, r, r + h/2), group = s
+      ))
+    } else {
+      loops <- bind_rows(loops, tibble(x = c(s, e), y = c(r, r), group = s))
+    }
+    i <- i + 1
+  }
+  
+  list(helices, strands, arrowheads, loops)
+}
+
+ss <- make_ss_elements(sec_df, structure_radius)
+
+# ── Clinical reference lollipops ──────────────────────────────────────────
+ref <- read_excel(DATA_PATH, sheet = "ReferenceSet", skip = 1) %>%
+  mutate(
+    pos = as.integer(str_extract(hgvs_pro, "\\d+")),
+    col = case_when(
+      disease_type %in% c("HCP", "HP") ~ "#AF22DD",
+      disease_type == "VUS"            ~ "grey50",
+      disease_type == "none"           ~ "#50DD22",
+      TRUE                             ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(pos), !is.na(col))
+
+# ── Build all rings ───────────────────────────────────────────────────────
+metal <- build_consensus(
+  DATA_PATH, "Mercury Map",
+  metal_inner_radius, ring_width, flip = TRUE
+)
+
+delta <- build_delta_ring(
+  DATA_PATH, "Delta Map",
+  DATA_PATH, "Baseline Map",
+  delta_inner_radius, delta_ring_height
+)
+
+base <- build_consensus(
+  DATA_PATH, "Baseline Map",
+  baseline_inner_radius, ring_width
+)
+
+axis_breaks <- c(1, 100, 200, 300, 400)
+
+# ── Shared plot builder ───────────────────────────────────────────────────
+build_plot <- function() {
+  ggplot() +
+    geom_rect(
+      data = metal,
+      aes(xmin = pos - 0.5, xmax = pos + 0.5, ymin = ymin, ymax = ymax, fill = class),
+      color = "grey80", linewidth = 0.2
+    ) +
+    scale_fill_manual(values = color_map, na.value = "white") +
+    new_scale_fill() +
+    geom_rect(
+      data = delta,
+      aes(xmin = pos - 0.5, xmax = pos + 0.5, ymin = ymin, ymax = ymax, fill = delta_bin),
+      color = "grey80", linewidth = 0.2
+    ) +
+    scale_fill_manual(values = delta_colors, na.value = "white") +
+    new_scale_fill() +
+    geom_rect(
+      data = base,
+      aes(xmin = pos - 0.5, xmax = pos + 0.5, ymin = ymin, ymax = ymax, fill = class),
+      color = "grey80", linewidth = 0.2
+    ) +
+    scale_fill_manual(values = color_map, na.value = "white") +
+    geom_segment(
+      data = ref,
+      aes(x = pos, xend = pos,
+          y = lollipop_base_radius,
+          yend = lollipop_base_radius + lollipop_height),
+      color = ref$col, linewidth = 0.5
+    ) +
+    geom_point(
+      data = ref,
+      aes(x = pos, y = lollipop_base_radius + lollipop_height),
+      color = ref$col, size = 1
+    ) +
+    geom_path(data = ss[[4]], aes(x, y, group = group), color = "grey40", linewidth = 2)  +
+    geom_polygon(data = ss[[2]], aes(x, y, group = group), fill = "black")                +
+    geom_polygon(data = ss[[3]], aes(x, y, group = group), fill = "black")                +
+    geom_line(data = ss[[1]], aes(x, y, group = group), color = "black", linewidth = 0.3) +
+    coord_polar(start = -pi/2) +
+    ylim(0, lollipop_base_radius + lollipop_height + 0.1) +
+    scale_x_continuous(breaks = axis_breaks, labels = axis_breaks) +
+    theme(
+      axis.text.x        = element_text(color = "black", size = 10),
+      panel.background   = element_rect(fill = "transparent", color = NA),
+      plot.background    = element_rect(fill = "transparent", color = NA),
+      panel.grid.major.x = element_line(color = "black", size = 0.2),
+      axis.ticks         = element_line(color = "black")
+    )
+}
+
+# ── Render interactive preview ────────────────────────────────────────────
+build_plot()
+
+# ── Export to PDF ─────────────────────────────────────────────────────────
+pdf(file = "~/Desktop/Fig1_Maps.pdf", width = 8, height = 8, useDingbats = FALSE)
+print(build_plot())
+dev.off()
+
+# ── Count residue positions where the dominant delta impact is APR (teal) ──
+baseline_map <- read_excel(DATA_PATH, sheet = "Baseline Map", skip = 1)
+colnames(baseline_map)[1:4] <- c("hgvs_pro", "baseline_score", "se", "df")
+baseline_map <- baseline_map %>% mutate(baseline_lower = baseline_score + se)
+
+baseline_miss_tolerated <- baseline_map %>%
+  filter(!grepl("Ter$", hgvs_pro), !grepl("=$", hgvs_pro), baseline_lower >= 0.5)
+
+teal_positions <- delta$pos[delta$delta_bin == "turquoise"]
+
+delta_raw <- read_excel(DATA_PATH, sheet = "Delta Map", skip = 1) %>%
+  mutate(
+    deltaScore  = as.numeric(deltaScore),
+    deltaSE     = as.numeric(deltaSE),
+    pos         = as.integer(str_extract(hgvs_pro, "\\d+")),
+    significant = case_when(
+    significant == "TRUE"  ~ TRUE,
+    significant == "FALSE" ~ FALSE,
+  TRUE                   ~ NA
+)  ) %>%
+  filter(!is.na(significant))
+
+delta_raw %>%
+  filter(
+    pos %in% teal_positions,
+    significant == TRUE,
+    deltaScore < 0,
+    hgvs_pro %in% baseline_miss_tolerated$hgvs_pro
+  ) %>%
+  summarise(n_positions = n_distinct(pos), n_variants = n())
+```
+
+
+```{r, Population Level Assessment, eval=FALSE}
+# =============================================================================
+# CHUNK 3 — Population-Level Assessment
+#
+# Tests whether the DMS functional scores are depleted for deleterious variants
+# in the human population, as expected under purifying selection.
+#
+# Method: log odds ratio comparing the observed frequency of deleterious /
+# neutral DMS variants in population databases vs. their expected frequency
+# under no selection. Fisher's exact test provides 95% CIs.
+#
+# Population sources:
+#   • UK Biobank — allele frequencies from the UK Biobank exome release
+#   • gnomAD v4  — population allele frequencies (gnomAD missense variants)
+# =============================================================================
+
+# ── Log odds ratio function ────────────────────────────────────────────────
+calculate_log_odds_ci <- function(CPOX_data, human_pop_data,
+                                  deleterious_threshold, neutral_threshold) {
+  
+  deleterious_variants <- CPOX_data %>%
+    filter(score < deleterious_threshold) %>%
+    select(hgvs_pro)
+  
+  neutral_variants <- CPOX_data %>%
+    filter(score > neutral_threshold) %>%
+    select(hgvs_pro)
+  
+  # Observed: how many DMS variants appear in the population dataset
+  observed_del <- sum(deleterious_variants$hgvs_pro %in% human_pop_data$hgvs_pro)
+  total_del    <- nrow(deleterious_variants)
+  expected_del <- (nrow(human_pop_data) / nrow(CPOX_data)) * total_del
+  
+  observed_neu <- sum(neutral_variants$hgvs_pro %in% human_pop_data$hgvs_pro)
+  total_neu    <- nrow(neutral_variants)
+  expected_neu <- (nrow(human_pop_data) / nrow(CPOX_data)) * total_neu
+  
+  # 2×2 contingency tables: observed vs. expected
+  del_table <- matrix(
+    c(observed_del, total_del - observed_del,
+      expected_del, total_del - expected_del),
+    nrow = 2, byrow = TRUE
+  )
+  
+  neu_table <- matrix(
+    c(observed_neu, total_neu - observed_neu,
+      expected_neu, total_neu - expected_neu),
+    nrow = 2, byrow = TRUE
+  )
+  
+  log_odds_del <- log((del_table[1,1] * del_table[2,2]) / (del_table[1,2] * del_table[2,1]))
+  log_odds_neu <- log((neu_table[1,1] * neu_table[2,2]) / (neu_table[1,2] * neu_table[2,1]))
+  
+  fisher_del <- fisher.test(del_table)
+  fisher_neu <- fisher.test(neu_table)
+  
+  list(
+    log_odds_del = log_odds_del,
+    log_odds_neu = log_odds_neu,
+    ci_del       = log(fisher_del$conf.int),
+    ci_neu       = log(fisher_neu$conf.int)
+  )
+}
+
+# ── UK Biobank ────────────────────────────────────────────────────────────
+# NOTE: UKBiobank sheet must be present in Manuscript_Data.xlsx
+UKBiobank <- tryCatch({
+  df <- read_sheet("UKBiobank")
+  if (nrow(df) == 0) stop("empty")
+  # Build HGVS protein notation from single-letter amino acid columns
+  df$hgvs_pro <- paste0(
+    substr(df$Amino_acids, 1, 1),
+    df$Protein_position,
+    substr(df$Amino_acids, nchar(df$Amino_acids), nchar(df$Amino_acids))
+  )
+  # Convert single-letter amino acid codes to three-letter (e.g. "A123V" → "Ala123Val")
+  df$hgvs_pro <- mgsub(
+    df$hgvs_pro,
+    pattern     = c("A","R","N","D","C","Q","E","G","H","I","L","K","M","F","P","O","S","U","T","W","Y","V"),
+    replacement = c("Ala","Arg","Asn","Asp","Cys","Gln","Glu","Gly","His","Ile","Leu","Lys","Met","Phe","Pro","Pyl","Ser","Sec","Thr","Trp","Tyr","Val")
+  )
+  df$hgvs_pro <- paste0("p.", df$hgvs_pro)
+  df <- df %>%
+    distinct(hgvs_pro, .keep_all = TRUE) %>%
+    filter(!grepl("X|\\*", hgvs_pro)) %>%
+    select(hgvs_pro, UKB_AF)
+  colnames(df)[2] <- "frequency"
+  df
+}, error = function(e) {
+  warning("UKBiobank sheet missing or empty in Manuscript_Data.xlsx — skipping. ",
+          "Add UKBiobank.csv data to that sheet (info row in row 1, headers in row 2).")
+  data.frame(hgvs_pro = character(), frequency = numeric())
+})
+
+# ── gnomAD v4 ─────────────────────────────────────────────────────────────
+# NOTE: gnomADv4_Data sheet must be present in Manuscript_Data.xlsx
+gnomad <- tryCatch({
+  df <- read_sheet("gnomADv4_Data")
+  if (nrow(df) == 0) stop("empty")
+  colnames(df)[12] <- "hgvs_pro"
+  colnames(df)[14] <- "type"
+  colnames(df)[20] <- "frequency"
+  df %>%
+    filter(type == "missense_variant") %>%
+    select(hgvs_pro, frequency) %>%
+    distinct(hgvs_pro, .keep_all = TRUE)
+}, error = function(e) {
+  warning("gnomADv4_Data sheet missing or empty in Manuscript_Data.xlsx — skipping. ",
+          "Add gnomADv4_Data.csv data to that sheet (info row in row 1, headers in row 2).")
+  data.frame(hgvs_pro = character(), frequency = numeric())
+})
+
+# ── Combine population datasets ────────────────────────────────────────────
+HumanPop_Frequency <- bind_rows(UKBiobank, gnomad) %>%
+  distinct(hgvs_pro, .keep_all = TRUE)
+
+cat("Total unique variants in combined population dataset:", nrow(HumanPop_Frequency), "\n")
+
+# ── Calculate log odds ─────────────────────────────────────────────────────
+baseline <- read_sheet("Baseline Map")
+
+deleterious_threshold <- 0.5
+neutral_threshold     <- 0.5
+
+log_odds <- calculate_log_odds_ci(baseline, HumanPop_Frequency,
+                                   deleterious_threshold, neutral_threshold)
+
+log_odds_data <- data.frame(
+  category = rep("baseline", 2),
+  Type     = c("deleterious", "neutral"),
+  Log_Odds = c(log_odds$log_odds_del, log_odds$log_odds_neu),
+  CI_Lower = c(log_odds$ci_del[1],   log_odds$ci_neu[1]),
+  CI_Upper = c(log_odds$ci_del[2],   log_odds$ci_neu[2])
+)
+
+# Point-range plot (log odds with 95% CI)
+pointRangeOdds <- ggplot(log_odds_data, aes(x = Type, y = Log_Odds)) +
+  geom_pointrange(
+    aes(ymin = CI_Lower, ymax = CI_Upper, color = category),
+    position = position_dodge(0.9),
+    size = 0.5
+  ) +
+  scale_color_manual(values = c("baseline" = "black")) +
+  labs(x = "Variant Type", y = "Log Odds Ratio") +
+  theme_minimal(base_size = 15) +
+  coord_flip()
+
+print(pointRangeOdds)
+```
+
+
+```{r, warning=FALSE, Comparison of Baseline and Metal Map Scores}
+# =============================================================================
+# CHUNK 4 — Baseline vs. Metal Map Correlation
+#
+# Tests the global agreement between the baseline and metal-condition DMS maps.
+# High correlation indicates that relative variant effects are preserved under
+# metal exposure; divergence reveals condition-specific responses.
+#
+# Pearson r is used (linear relationship expected between scaled scores).
+# Dashed orange lines at score = 0.5 mark the LOF/functional boundary.
+# =============================================================================
+
+baseline_map <- read_sheet("Baseline Map")
+metal_map    <- read_sheet("Mercury Map")
+
+names(baseline_map)[names(baseline_map) == "score"] <- "baseline"
+names(metal_map)[names(metal_map)       == "score"] <- "metal"
+
+merged_maps     <- merge(baseline_map, metal_map, by = "hgvs_pro")
+merged_maps$pos <- as.numeric(gsub("\\D", "", merged_maps$hgvs_pro))
+
+cor_pear <- cor.test(merged_maps$baseline, merged_maps$metal, method = "pearson")
+cat(sprintf("Pearson r = %.2f, p = %.3g\n", cor_pear$estimate, cor_pear$p.value))
+r_value_spear <- cor(merged_maps$baseline, merged_maps$metal, method = "spearman")
+
+maps_corr <- ggplot(merged_maps, aes(x = baseline, y = metal)) +
+  geom_point(alpha = 0.15) +
+  geom_smooth(method = "lm", se = FALSE, color = "turquoise", linewidth = 0.8) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "darkorange") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "darkorange") +
+  labs(x = "Baseline CPOX Map", y = "Conditional CPOX Map \n (Metal;Hg)") +
+  theme_minimal(base_size = 15) +
+  annotate(
+    "text",
+    x = max(merged_maps$baseline),
+    y = min(merged_maps$metal),
+    label = paste("R = ", round(cor_pear$estimate, 2)),
+    hjust = 1
+  )
+
+pdf("~/Desktop/BetweenMapCorrelation.pdf", width = 8, height = 6)
+print(maps_corr)
+dev.off()
+```
+
+
+```{r, warning=FALSE, Examining Delta Scores}
+# =============================================================================
+# CHUNK 5 — Delta Score Analysis
+#
+# The delta score captures the change in functional fitness between the
+# baseline and metal (Hg) conditions: delta = baseline_logPhi – metal_logPhi
+# Positive delta → variant tolerates baseline but not metal (APR)
+# Negative delta → variant is improved by metal exposure
+#
+# This chunk:
+#   1. Tests whether there is a systematic shift using a paired Wilcoxon test
+#   2. Plots a mirrored bar histogram: controls (synonymous + nonsense) above
+#      zero, missense below zero
+#   3. Plots the full distribution of all delta scores
+# =============================================================================
+
+delta_map <- read_sheet("Delta Map") %>% na.omit()
+
+# Overall median shift between conditions
+median_diff <- median(
+  delta_map$logPhi_weighted_mean_metal - delta_map$logPhi_weighted_mean_baseline,
+  na.rm = TRUE
+)
+
+# Paired Wilcoxon: tests whether the two conditions differ per variant
+wilcox_res <- wilcox.test(
+  delta_map$logPhi_weighted_mean_baseline,
+  delta_map$logPhi_weighted_mean_metal,
+  paired      = TRUE,
+  alternative = "two.sided",
+  exact       = FALSE
+)
+
+cat("Median difference (metal - baseline):", median_diff, "\n")
+print(wilcox_res)
+
+process_delta <- function(delta_path) {
+  
+  data <- read_sheet("Delta Map") %>% na.omit()
+  
+  stop_idx  <- grepl("Ter$", data$hgvs_pro)
+  syn_idx   <- grepl("=$",   data$hgvs_pro)
+  miss_idx  <- !(stop_idx | syn_idx)
+  
+  cntl_scores <- data$deltaScore[stop_idx | syn_idx]
+  miss_scores <- data$deltaScore[miss_idx]
+  
+  # ── Plot 1: Mirrored density histogram ────────────────────────────────
+  hist_breaks <- seq(-3, 3, by = 0.1)
+  cntl_hist   <- hist(cntl_scores, breaks = hist_breaks, plot = FALSE)
+  miss_hist   <- hist(miss_scores, breaks = hist_breaks, plot = FALSE)
+  
+  plot_df <- rbind(
+    data.frame(bin = cntl_hist$mids, density = cntl_hist$density,   type = "cntl"),
+    data.frame(bin = miss_hist$mids, density = -miss_hist$density,  type = "missense")
+  )
+  
+  Grouped_Delta <- ggplot(plot_df, aes(x = bin, y = density, fill = type)) +
+    geom_col(width = 0.095) +
+    scale_fill_manual(values = c("cntl" = "black", "missense" = "grey60")) +
+    labs(
+      title = "Delta Score Density: Controls vs Missense",
+      x = "Delta Score",
+      y = "Density"
+    ) +
+    theme_minimal() +
+    theme(axis.title = element_text(size = 14), axis.text = element_text(size = 12),
+          legend.position = "top")
+  
+  pdf("~/Desktop/group_Delta.pdf", width = 8, height = 6)
+  print(Grouped_Delta)
+  dev.off()
+  
+  # ── Plot 2: Full delta score distribution ──────────────────────────────
+  complete_Delta_dis <- ggplot(
+    data.frame(deltaScore = data$deltaScore),
+    aes(x = deltaScore)
+  ) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      binwidth = 0.05, fill = "grey40", color = "black", alpha = 0.6
+    ) +
+    geom_density(linewidth = 1.2) +
+    labs(title = "Distribution of All Delta Scores", x = "Delta Score", y = "Density") +
+    theme_minimal() +
+    theme(title = element_text(size = 14, face = "bold"),
+          axis.title = element_text(size = 14), axis.text = element_text(size = 12))
+  
+  pdf("~/Desktop/complete_Delta.pdf", width = 8, height = 6)
+  print(complete_Delta_dis)
+  dev.off()
+}
+
+process_delta("~/Desktop/Manuscript_Data.xlsx")  # reads sheet "Delta Map"
+```
+
+
+```{r, warning=FALSE, Comparison of Baseline & Metal Map Scores with Predicted ΔΔG Scores}
+# =============================================================================
+# CHUNK 6 — Functional Scores vs. Predicted ΔΔG
+#
+# Compares DMS scores (baseline and metal) to in silico thermodynamic
+# stability predictions (ΔΔG) based on the CPOX crystal structure (PDB: 2AEX).
+#
+# Workflow:
+#   1. Convert ΔΔG variant notation to HGVS
+#   2. Merge with DMS scores
+#   3. Compute 15-aa rolling means per position
+#   4. Plot rolling mean traces for baseline, metal, and ΔΔG
+#   5. Pearson correlation with BH-adjusted p-values
+#   6. Scatter plots with r annotation
+# =============================================================================
+
+ddG_scores <- read_sheet("ddG Values")
+#ddG_scores <- subset(ddG_scores, CHAIN != "")
+
+# Single-letter → three-letter amino acid dictionary
+aa_dict <- c("A"="Ala","R"="Arg","N"="Asn","D"="Asp","C"="Cys","Q"="Gln",
+             "E"="Glu","G"="Gly","H"="His","I"="Ile","L"="Leu","K"="Lys",
+             "M"="Met","F"="Phe","P"="Pro","S"="Ser","T"="Thr","W"="Trp",
+             "Y"="Tyr","V"="Val")
+
+
+
+# Convert "A123V" → "p.Ala123Val"
+replace_aa <- function(s) {
+  for (aa in names(aa_dict)) s <- gsub(aa, aa_dict[aa], s)
+  return(paste0("p.", s))
+}
+
+ddG_scores$VARIANT <- replace_aa(ddG_scores$VARIANT)
+ddG_scores <- ddG_scores[, c(1, 3)]
+colnames(ddG_scores) <- c("hgvs_pro", "ddG")
+
+ddG_scores$hgvs_pro <- ddG_scores$hgvs_pro %>%
+  gsub("Glyln", "Gln", .) %>%
+  gsub("Glylu", "Glu", .) %>%
+  gsub("Prohe", "Phe", .)
+
+# Load and rename map columns
+baseline_map <- read_sheet("Baseline Map")
+colnames(baseline_map)[2:4] <- c("baseline", "baselineSE", "baselineDF")
+
+metal_map <- read_sheet("Mercury Map")
+setDT(metal_map)
+colnames(metal_map)[2:4] <- c("metal", "metalSE", "metalDF")
+
+# Merge and remove synonymous variants (regex: same AA before and after position)
+Stability <- ddG_scores |>
+  merge(baseline_map, by = "hgvs_pro") |>
+  merge(metal_map,    by = "hgvs_pro") |>
+  subset(!grepl("(\\w\\d+)(\\1)", hgvs_pro)) |>
+  unique()
+
+Stability$pos <- as.numeric(gsub("\\D", "", Stability$hgvs_pro))
+
+# 15-aa rolling mean smoothing for positional trends
+Rolling_Stability <- Stability |>
+  dplyr::group_by(pos) |>
+  dplyr::summarize(
+    mean_baseline = mean(baseline,       na.rm = TRUE),
+    mean_metal    = mean(metal,          na.rm = TRUE),
+    mean_ddG      = mean(as.integer(ddG), na.rm = TRUE),
+    .groups       = "drop"
+  ) |>
+  dplyr::mutate(
+    rolling_baseline = zoo::rollmean(mean_baseline, k = 15, fill = NA, align = "center"),
+    rolling_metal    = zoo::rollmean(mean_metal,    k = 15, fill = NA, align = "center"),
+    rolling_ddG      = zoo::rollmean(mean_ddG,      k = 15, fill = NA, align = "center")
+  )
+
+# Melt to long format for faceted plotting
+Rolling_Stability_long <- reshape2::melt(
+  Rolling_Stability[, c("pos","rolling_baseline","rolling_metal","rolling_ddG")],
+  id.vars       = "pos",
+  variable.name = "Metric",
+  value.name    = "Score"
+)
+
+# Rolling mean line plot per metric
+plot_metric <- function(data, metric_name, color, ylab) {
+  ggplot(data[data$Metric == metric_name, ], aes(x = pos, y = Score)) +
+    geom_line(size = 0.5, color = color) +
+    labs(x = "Amino Acid Position", y = ylab) +
+    geom_vline(xintercept = seq(0, 450, by = 50), color = "grey", linetype = "dotted") +
+    theme_minimal() +
+    theme(panel.grid.major.x = element_line(color = "grey", linetype = "dotted"),
+          axis.text.x = element_text(angle = 0, hjust = 1)) +
+    scale_x_continuous(limits = range(data$pos, na.rm = TRUE))
+}
+
+p1 <- plot_metric(Rolling_Stability_long, "rolling_baseline", "#11EE89", "Baseline Score\n(Moving Avg, 15 AA)")
+p2 <- plot_metric(Rolling_Stability_long, "rolling_metal",    "#EE1176", "Metal Score\n(Moving Avg, 15 AA)")
+p3 <- plot_metric(Rolling_Stability_long, "rolling_ddG",      "black",   "Predicted ΔΔG\n(Moving Avg, 15 AA)")
+gridExtra::grid.arrange(p1, p2, p3, ncol = 1)
+
+# Pearson correlations between functional scores and ΔΔG
+cor_baseline <- cor.test(Stability$baseline, Stability$ddG, method = "pearson")
+cor_metal    <- cor.test(Stability$metal,    Stability$ddG, method = "pearson")
+
+# BH-adjusted p-values (two tests)
+raw_pvals <- c(cor_baseline$p.value, cor_metal$p.value)
+padj      <- p.adjust(raw_pvals, method = "BH")
+names(padj) <- c("Baseline vs ΔΔG", "Metal vs ΔΔG")
+
+cat(sprintf("Baseline vs ΔΔG: Pearson r = %.2f, p = %.3g, padj = %.3g\n",
+            cor_baseline$estimate, cor_baseline$p.value, padj[1]))
+cat(sprintf("Metal vs ΔΔG:    Pearson r = %.2f, p = %.3g, padj = %.3g\n",
+            cor_metal$estimate, cor_metal$p.value, padj[2]))
+
+# Scatter plot helper
+plot_scatter <- function(x, y, cor_result, padj_value, title, color) {
+  ggplot(Stability, aes_string(x = x, y = y)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", color = color) +
+    annotate("text",
+             x     = max(Stability[[x]], na.rm = TRUE),
+             y     = min(Stability[[y]], na.rm = TRUE),
+             label = sprintf("r = %.2f\np = %.3g", cor_result$estimate, cor_result$p.value),
+             hjust = 1, vjust = 0, size = 4) +
+    labs(x = x, y = "Predicted ΔΔG Score", title = title) +
+    theme_minimal() +
+    theme(panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+          axis.text.x = element_text(angle = 0),
+          axis.text.y = element_text(angle = 0))
+}
+
+scatter1 <- plot_scatter("baseline", "ddG", cor_baseline, padj[1], "Baseline Score vs. ΔΔG", "turquoise")
+scatter2 <- plot_scatter("metal",    "ddG", cor_metal,    padj[2], "Metal Score vs. ΔΔG",    "purple")
+
+pdf("~/Desktop/ddG&MapCorrelation.pdf",  width = 8, height = 6); print(scatter1); dev.off()
+pdf("~/Desktop/ddG&MapCorrelation2.pdf", width = 8, height = 6); print(scatter2); dev.off()
+```
+
+
+```{r, warning=FALSE, Comparison of Baseline & Metal Map Scores with Patient Enzymatic Activity}
+# =============================================================================
+# CHUNK 7 — Correlation with Patient Enzymatic Activity
+#
+# Tests whether the DMS functional score predicts residual CPOX enzymatic
+# activity measured in HCP patients. Activity is expressed as a percentage
+# of the lower reference value.
+#
+# Both Pearson and Spearman correlations are reported. Median activity per
+# variant is used (multiple patients may carry the same variant).
+# =============================================================================
+
+process_activity_correlation <- function(baseline_path = NULL,
+                                          metal_path    = NULL,
+                                          activity_path = NULL) {
+  
+  # Inner helper: merge map scores with activity data and aggregate per variant
+  prepare_correlation_data <- function(map_data, activity_data, score_column) {
+    merged <- merge(activity_data, map_data, by = "hgvs_pro")
+    # Filter to rows where HCP patient enzyme activity is present
+    merged <- merged[!is.na(merged$hcp_enzyme_activity), ]
+    merged <- merged[, c("hgvs_pro", "pct_activity", score_column)]
+    
+    # Median activity per variant (collapses multiple patient entries)
+    median_activity <- aggregate(
+      pct_activity ~ hgvs_pro,
+      data = merged, FUN = median, na.rm = TRUE
+    )
+    colnames(median_activity) <- c("hgvs_pro", "median_activity")
+    
+    out <- merge(map_data, median_activity, by = "hgvs_pro")
+    out[complete.cases(out), ]
+  }
+  
+  if (!is.null(activity_path)) {
+    activity_data <- read_sheet("Enzymatic Activity")
+    if (nrow(activity_data) == 0 || ncol(activity_data) == 0) {
+      warning("Enzymatic Activity sheet is empty in Manuscript_Data.xlsx. ",
+              "Please paste the CPOX_activities.csv data into that sheet ",
+              "(with a generic info row in row 1 and column headers in row 2). ",
+              "Skipping activity correlation.")
+      return(invisible(NULL))
+    }
+    # Rename by position: col names contain newlines and special characters
+    # Col 4 = Amino acid change (hgvs_pro)
+    # Col 5 = HCP patients Enzyme activity
+    # Col 8 = % of activity compared to the lower reference value
+    colnames(activity_data)[c(4, 5, 8)] <- c("hgvs_pro", "hcp_enzyme_activity", "pct_activity")
+    activity_data$hgvs_pro            <- as.character(activity_data$hgvs_pro)
+    activity_data$hcp_enzyme_activity <- suppressWarnings(as.numeric(activity_data$hcp_enzyme_activity))
+    activity_data$pct_activity        <- suppressWarnings(as.numeric(activity_data$pct_activity))
+  } else {
+    stop("Activity data required.")
+  }
+  
+  # ── BASELINE ──────────────────────────────────────────────────────────
+  if (!is.null(baseline_path)) {
+    baseline_map <- read_sheet("Baseline Map")
+    colnames(baseline_map)[2] <- "baseline_score"
+    baseline_map <- baseline_map[, c("hgvs_pro", "baseline_score")]
+    
+    baseline_data <- prepare_correlation_data(baseline_map, activity_data, "baseline_score")
+    
+    spearman_baseline <- cor.test(baseline_data$median_activity, baseline_data$baseline_score, method = "spearman")
+    pearson_baseline  <- cor.test(baseline_data$median_activity, baseline_data$baseline_score, method = "pearson")
+    
+    print(paste("Spearman (Baseline):", round(spearman_baseline$estimate, 2),
+                "P =", signif(spearman_baseline$p.value, 3)))
+    print(paste("Pearson (Baseline):",  round(pearson_baseline$estimate,  2),
+                "P =", signif(pearson_baseline$p.value,  3)))
+    
+    pdf("~/Desktop/Baseline_Activity.pdf", width = 8, height = 6)
+    plot(baseline_data$median_activity, baseline_data$baseline_score,
+         xlab = "Activity (% of lower reference value)",
+         ylab = "Baseline Score",
+         main = paste("Spearman r =", round(spearman_baseline$estimate, 2),
+                      "p =", signif(spearman_baseline$p.value, 2),
+                      "\nPearson r =", round(pearson_baseline$estimate, 2),
+                      "p =", signif(pearson_baseline$p.value, 2)),
+         pch = 19, col = "grey40")
+    abline(lm(baseline_score ~ median_activity, data = baseline_data), lwd = 2)
+    dev.off()
+  }
+  
+  # ── METAL ─────────────────────────────────────────────────────────────
+  if (!is.null(metal_path)) {
+    metal_map <- read_sheet("Mercury Map")
+    colnames(metal_map)[2] <- "metal_score"
+    metal_map <- metal_map[, c("hgvs_pro", "metal_score")]
+    
+    metal_data <- prepare_correlation_data(metal_map, activity_data, "metal_score")
+    
+    spearman_metal <- cor.test(metal_data$median_activity, metal_data$metal_score, method = "spearman")
+    pearson_metal  <- cor.test(metal_data$median_activity, metal_data$metal_score, method = "pearson")
+    
+    print(paste("Spearman (Metal):", round(spearman_metal$estimate, 2),
+                "P =", signif(spearman_metal$p.value, 3)))
+    print(paste("Pearson (Metal):",  round(pearson_metal$estimate,  2),
+                "P =", signif(pearson_metal$p.value,  3)))
+    
+    pdf("~/Desktop/Metal_Activity.pdf", width = 8, height = 6)
+    plot(metal_data$median_activity, metal_data$metal_score,
+         xlab = "Activity (% of lower reference value)",
+         ylab = "Metal Score",
+         main = paste("Spearman r =", round(spearman_metal$estimate, 2),
+                      "p =", signif(spearman_metal$p.value, 2),
+                      "\nPearson r =", round(pearson_metal$estimate, 2),
+                      "p =", signif(pearson_metal$p.value, 2)),
+         pch = 19, col = "grey40")
+    abline(lm(metal_score ~ median_activity, data = metal_data), lwd = 2)
+    dev.off()
+  }
+}
+
+process_activity_correlation(
+  baseline_path = "~/Desktop/Manuscript_Data.xlsx",
+  metal_path    = "~/Desktop/Manuscript_Data.xlsx",
+  activity_path = "~/Desktop/Manuscript_Data.xlsx"
+)
+```
+
+
+```{r, warning=FALSE, Hypercomplementing variant scores: Baseline Map vs AlphaMissense}
+# =============================================================================
+# CHUNK 8 — Hypercomplementing Variants vs. AlphaMissense
+#
+# Hypercomplementing variants are defined as those with baseline score > 1.2
+# (above the WT reference range). These may represent gain-of-function or
+# hyperstable variants.
+#
+# This chunk compares the DMS baseline score against AlphaMissense predictions
+# for this subset. AlphaMissense scores are rescaled to [0,1] for direct
+# comparison. Expected: AlphaMissense should score these variants as
+# damaging (high score) while DMS shows elevated function.
+# =============================================================================
+
+baseline_file <- read_sheet("Baseline Map")
+setDT(baseline_file)
+colnames(baseline_file)[2] <- "baseline_map"
+baseline_file <- baseline_file[, .(hgvs_pro, baseline_map)]
+
+AM_Data <- read_sheet("AlphaMissense Values")
+setDT(AM_Data)
+colnames(AM_Data)[1:2] <- c("hgvs_pro", "AM")
+
+# Keep only hypercomplementing variants (score > 1.2)
+Hyper_Data <- merge(AM_Data, baseline_file, by = "hgvs_pro")
+Hyper_Data <- Hyper_Data[baseline_map > 1.2]
+Hyper_Data <- na.omit(Hyper_Data)
+
+# Rescale AlphaMissense to [0,1] for comparable y-axis with baseline
+rescaled_AM  <- (Hyper_Data$AM - min(Hyper_Data$AM)) / (max(Hyper_Data$AM) - min(Hyper_Data$AM))
+rescaled_Map <- Hyper_Data$baseline_map
+
+Map_Preditor_Hyper_Scores <- data.table(
+  AlphaMissense = rescaled_AM,
+  BaselineMap   = rescaled_Map
+)
+
+Map_Preditor_Hyper_Scores_long <- melt(Map_Preditor_Hyper_Scores,
+                                        variable.name = "Predictor",
+                                        value.name    = "Score")
+
+hypercomplementing <- ggplot(Map_Preditor_Hyper_Scores_long, aes(x = Predictor, y = Score)) +
+  theme_classic() +
+  geom_boxplot() +
+  geom_jitter(color = alpha("black", 0.5), stroke = 0.5, width = 0.2) +
+  ylab("Level of Functionality") +
+  xlab("") +
+  theme(legend.position = "none")
+
+print(hypercomplementing)
+
+ggsave(filename = "~/Desktop/hypercomplementing.pdf",
+       plot = hypercomplementing, device = "pdf", width = 8, height = 8)
+```
+
+
+```{r, warning=FALSE, Dunham vs Baseline scores}
+# =============================================================================
+# CHUNK 9 — Dunham 33-Map Substitution Trend Comparison
+#
+# Tests whether the amino acid substitution trends in the CPOX baseline and
+# metal maps are consistent with trends across 33 published DMS maps
+# (Dunham & Beltrao, 2021).
+#
+# Focuses on the TO residue: for each destination amino acid, compares the
+# median score across the CPOX maps and the Dunham aggregated matrix.
+# Also compares baseline vs. metal directly.
+# Spearman rank correlation is used throughout.
+# =============================================================================
+
+# ── Helper: pre-process missense variants ────────────────────────────────
+process_map <- function(map) {
+  map %>%
+    filter(!str_detect(hgvs_pro, "=|Ter")) %>%
+    mutate(
+      from     = substr(hgvs_pro, 3, 5),
+      pos      = str_extract(hgvs_pro, "\\d+"),
+      changeTo = substr(hgvs_pro, nchar(hgvs_pro) - 2, nchar(hgvs_pro)),
+      aa_type_From = case_when(
+        from %in% c("Ala","Gly","Val","Leu","Ile","Met","Phe","Trp","Tyr") ~ "hydrophobic",
+        from %in% c("Ser","Thr","Asn","Gln","Cys")                        ~ "polar",
+        from %in% c("Asp","Glu","Arg","Lys","His")                        ~ "charged",
+        from %in% c("Pro")                                                  ~ "proline",
+        TRUE                                                                ~ "unknown"
+      ),
+      aa_type_To = case_when(
+        changeTo %in% c("Ala","Gly","Val","Leu","Ile","Met","Phe","Trp","Tyr") ~ "hydrophobic",
+        changeTo %in% c("Ser","Thr","Asn","Gln","Cys")                        ~ "polar",
+        changeTo %in% c("Asp","Glu")                                           ~ "neg_charged",
+        changeTo %in% c("Arg","Lys","His")                                     ~ "pos_charged",
+        changeTo %in% c("Pro")                                                  ~ "proline",
+        TRUE                                                                     ~ "unknown"
+      )
+    )
+}
+
+baseline_map       <- read_sheet("Baseline Map")
+baseline_processed <- process_map(baseline_map)
+
+# Median score per destination amino acid in baseline map
+median_scores_baseline_to <- baseline_processed %>%
+  group_by(changeTo) %>%
+  summarise(median_score_baseline_to = median(score, na.rm = TRUE), .groups = "drop")
+
+# Read Dunham matrix and set synonymous positions to NA
+Dunham                 <- read_sheet("Dunham Maps")
+AminoAcidChangesDunham <- Dunham[, 4:24]
+
+AminoAcidChangesDunham <- AminoAcidChangesDunham %>%
+  rowwise() %>%
+  mutate(across(everything(), ~ ifelse(cur_column() == wt, NA, .))) %>%
+  ungroup()
+
+# Median per destination AA in Dunham matrix
+median_Dunham <- AminoAcidChangesDunham %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), ~ median(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "changeTo", values_to = "median_dunham_to")
+
+# Convert single-letter AA codes to three-letter
+aa_replacements <- setNames(
+  c("Ala","Arg","Asn","Asp","Cys","Gln","Glu","Gly","His","Ile","Leu","Lys",
+    "Met","Phe","Pro","Pyl","Ser","Thr","Trp","Tyr","Val"),
+  c("A","R","N","D","C","Q","E","G","H","I","L","K","M","F","P","O","S","T","W","Y","V")
+)
+median_Dunham$changeTo <- str_replace_all(median_Dunham$changeTo, aa_replacements)
+# Fix multi-substitution artefacts from sequential string replacement
+median_Dunham$changeTo <- median_Dunham$changeTo %>%
+  gsub("Glyln", "Gln", .) %>%
+  gsub("Glylu", "Glu", .) %>%
+  gsub("Prohe", "Phe", .)
+
+aggregate_dunham_maps_toAAscores <- merge(median_Dunham, median_scores_baseline_to, by = "changeTo")
+
+# Scatter plot with Spearman correlation annotation
+compare_variables <- function(data, var1, var2, label_var, x_label, y_label) {
+  cor_test <- cor.test(data[[var1]], data[[var2]], method = "spearman")
+  p <- ggplot(data, aes(x = .data[[var1]], y = .data[[var2]])) +
+    geom_point(alpha = 0.5) +
+    theme_minimal() +
+    labs(x = x_label, y = y_label) +
+    ggtitle(paste("Correlation:", round(cor_test$estimate, 3),
+                  "P-value:", format.pval(cor_test$p.value, digits = 3, format = "e"))) +
+    geom_text_repel(aes(label = changeTo), size = 4, box.padding = 0.5)
+  list(correlation = cor_test$estimate, p_value = cor_test$p.value)
+  print(p)
+}
+
+result_baseline_Dunham <- compare_variables(
+  aggregate_dunham_maps_toAAscores, "median_score_baseline_to", "median_dunham_to", "changeTo",
+  "median score\n baseline map", "median score\n Dunham and Beltrao, 2021"
+)
+
+# ── Metal map comparisons ─────────────────────────────────────────────────
+metal_map       <- read_sheet("Mercury Map")
+metal_processed <- process_map(metal_map)
+
+median_scores_metal_to <- metal_processed %>%
+  group_by(changeTo) %>%
+  summarise(median_score_metal_to = median(score, na.rm = TRUE), .groups = "drop")
+
+aggregate_metal_maps_toAAscores <- merge(median_scores_baseline_to, median_scores_metal_to, by = "changeTo")
+result_metal_baseline <- compare_variables(
+  aggregate_metal_maps_toAAscores, "median_score_baseline_to", "median_score_metal_to", "changeTo",
+  "median score\n baseline map", "median score\n metal map"
+)
+
+aggregate_dunham_metalmaps_toAAscores <- merge(median_Dunham, median_scores_metal_to, by = "changeTo")
+result_metal_Dunham <- compare_variables(
+  aggregate_dunham_metalmaps_toAAscores, "median_score_metal_to", "median_dunham_to", "changeTo",
+  "median score\n metal map", "median score\n Dunham and Beltrao, 2021"
+)
+```
+
+
+```{r, warning=FALSE, Impact Based on Substitution/AA Type}
+# =============================================================================
+# CHUNK 10 — Amino Acid Substitution Type Analysis (FROM / TO)
+#
+# Tests whether the physicochemical class of the source (FROM) or destination
+# (TO) amino acid predicts variant functional impact.
+#
+# FROM analysis: excludes self-substitutions; uses broad categories
+#   (hydrophobic / polar / charged / proline)
+# TO analysis:   uses detailed categories (splits charged into +/- for TO)
+#   and performs binary comparisons (e.g. "TO proline" vs. "not proline")
+#
+# Statistics: pairwise Wilcoxon with Bonferroni correction.
+# Plots saved automatically to ~/Desktop/.
+# =============================================================================
+
+library(data.table); library(dplyr); library(stringr); library(ggplot2); library(ggpubr)
+
+baseline <- read_sheet("Baseline Map")
+metal    <- read_sheet("Mercury Map")
+
+# Amino acid class definitions
+aa_cats_basic <- list(
+  hydrophobic = c("Ala","Gly","Val","Leu","Ile","Met","Phe","Trp","Tyr"),
+  polar       = c("Ser","Thr","Asn","Gln","Cys"),
+  charged     = c("Asp","Glu","Arg","Lys","His"),
+  proline     = c("Pro")
+)
+
+# Detailed version: charged split into negative / positive for TO analysis
+aa_cats_detailed <- list(
+  hydrophobic = aa_cats_basic$hydrophobic,
+  polar       = aa_cats_basic$polar,
+  neg_charged = c("Asp","Glu"),
+  pos_charged = c("Arg","Lys","His"),
+  proline     = aa_cats_basic$proline
+)
+
+# Extract FROM/TO residues and assign amino acid class labels
+process_map <- function(map, detailed = FALSE) {
+  map_missense           <- map[!(grepl("=", map$hgvs_pro) | grepl("Ter", map$hgvs_pro)), ]
+  map_missense$from      <- substr(map_missense$hgvs_pro, 3, 5)
+  map_missense$pos       <- str_extract(map_missense$hgvs_pro, "[0-9]+")
+  map_missense$changeTo  <- substr(map_missense$hgvs_pro,
+                                    nchar(map_missense$hgvs_pro) - 2,
+                                    nchar(map_missense$hgvs_pro))
+  cats <- if (detailed) aa_cats_detailed else aa_cats_basic
+  map_missense <- map_missense %>%
+    mutate(
+      aa_type_From = case_when(
+        from %in% cats$hydrophobic ~ "hydrophobic",
+        from %in% cats$polar ~ "polar",
+        detailed & from %in% cats$neg_charged ~ "neg_charged",
+        detailed & from %in% cats$pos_charged ~ "pos_charged",
+        !detailed & from %in% cats$charged ~ "charged",
+        from %in% cats$proline ~ "proline",
+        TRUE ~ "unknown"
+      ),
+      aa_type_To = case_when(
+        changeTo %in% cats$hydrophobic ~ "hydrophobic",
+        changeTo %in% cats$polar ~ "polar",
+        detailed & changeTo %in% cats$neg_charged ~ "neg_charged",
+        detailed & changeTo %in% cats$pos_charged ~ "pos_charged",
+        !detailed & changeTo %in% cats$charged ~ "charged",
+        changeTo %in% cats$proline ~ "proline",
+        TRUE ~ "unknown"
+      )
+    )
+  return(map_missense)
+}
+
+# Unified analysis: pairwise Wilcoxon + boxplot with significance brackets
+analyze_aa_category <- function(data, direction = c("FROM","TO"),
+                                 simple_group = NULL, plot_title,
+                                 pdf_filename, width = 6, height = 6) {
+  direction <- match.arg(direction)
+  aa_col    <- ifelse(direction == "FROM", "aa_type_From", "aa_type_To")
+  
+  if (direction == "FROM") data <- data[data$aa_type_From != data$aa_type_To, ]
+  
+  if (!is.null(simple_group)) {
+    group_col <- paste0(aa_col, "_simple")
+    data <- data %>%
+      mutate(!!group_col := ifelse(get(aa_col) == simple_group, simple_group,
+                                    paste0("not_", simple_group)))
+    data[[group_col]] <- factor(data[[group_col]],
+                                levels = c(simple_group, paste0("not_", simple_group)))
+  } else {
+    group_col         <- aa_col
+    data[[group_col]] <- factor(data[[group_col]])
+  }
+  
+  categories <- levels(data[[group_col]])
+  if (length(categories) < 2) return(NULL)
+  
+  results <- data.frame()
+  for (i in 1:(length(categories) - 1)) {
+    for (j in (i + 1):length(categories)) {
+      cat1 <- categories[i]; cat2 <- categories[j]
+      g1   <- data$score[data[[group_col]] == cat1]
+      g2   <- data$score[data[[group_col]] == cat2]
+      test <- wilcox.test(g1, g2, correct = TRUE)
+      results <- rbind(results, data.frame(
+        Category1 = cat1, Category2 = cat2,
+        p.value   = test$p.value,
+        Median1   = median(g1, na.rm = TRUE),
+        Median2   = median(g2, na.rm = TRUE)
+      ))
+    }
+  }
+  results$p.adj <- p.adjust(results$p.value, method = "bonferroni")
+  
+  p <- ggplot(data, aes_string(x = group_col, y = "score")) +
+    geom_boxplot(outlier.size = 0.3) +
+    labs(title = plot_title, x = paste(direction, "amino acid category"),
+         y = "Variant functional score") +
+    theme_minimal(base_size = 17)
+  
+  sig_results <- results[results$p.adj < 0.05, ]
+  if (nrow(sig_results) > 0) {
+    comps <- mapply(c, sig_results$Category1, sig_results$Category2, SIMPLIFY = FALSE)
+    p <- p + stat_compare_means(comparisons = comps, method = "wilcox.test",
+                                label = "p.signif", p.adjust.method = "bonferroni")
+  }
+  
+  ggsave(paste0("~/Desktop/", pdf_filename), plot = p, device = "pdf",
+         width = width, height = height)
+  print(p)
+}
+
+baseline_basic    <- process_map(baseline, FALSE)
+metal_basic       <- process_map(metal,    FALSE)
+baseline_detailed <- process_map(baseline, TRUE)
+metal_detailed    <- process_map(metal,    TRUE)
+
+# FROM analyses (broad categories)
+analyze_aa_category(baseline_basic, "FROM", NULL, "Baseline map: FROM amino acid type", "Baseline_FROM_full.pdf")
+analyze_aa_category(metal_basic,    "FROM", NULL, "Metal map: FROM amino acid type",    "Metal_FROM_full.pdf")
+
+# TO analyses — baseline (binary comparisons per class)
+analyze_aa_category(baseline_detailed, "TO", "polar",       "Baseline map: TO polar vs others",           "Baseline_TO_polar.pdf")
+analyze_aa_category(baseline_detailed, "TO", "hydrophobic", "Baseline map: TO hydrophobic vs others",     "Baseline_TO_hydrophobic.pdf")
+analyze_aa_category(baseline_detailed, "TO", "proline",     "Baseline map: TO proline vs others",         "Baseline_TO_proline.pdf")
+analyze_aa_category(baseline_detailed, "TO", "neg_charged", "Baseline map: TO negative charged vs others","Baseline_TO_neg_charged.pdf")
+
+# TO analyses — metal map
+analyze_aa_category(metal_detailed, "TO", "polar",       "Metal map: TO polar vs others",           "Metal_TO_polar.pdf")
+analyze_aa_category(metal_detailed, "TO", "hydrophobic", "Metal map: TO hydrophobic vs others",     "Metal_TO_hydrophobic.pdf")
+analyze_aa_category(metal_detailed, "TO", "proline",     "Metal map: TO proline vs others",         "Metal_TO_proline.pdf")
+analyze_aa_category(metal_detailed, "TO", "neg_charged", "Metal map: TO negative charged vs others","Metal_TO_neg_charged.pdf")
+```
+
+
+```{r, warning=FALSE, Impact Based on Quaternary Structure}
+# =============================================================================
+# CHUNK 11 — Structure-Based Analysis (SASA / Quaternary Domains)
+#
+# Tests whether positional median DMS scores differ between structural contexts:
+#   • core          : buried (SASA < 25 Å²), excluding functional sites
+#   • surface       : exposed (SASA > 50 Å²), excluding functional sites
+#   • active site   : catalytic residues
+#   • dimer interface: residues at the CPOX homodimer interface
+#   • MTS           : mitochondrial targeting sequence (residues 1–110)
+#
+# Pairwise Wilcoxon tests are performed for both baseline and metal maps.
+# Results are visualised as boxplots and a triangular heatmap (baseline =
+# upper-left triangle, metal = lower-right triangle).
+# =============================================================================
+
+library(data.table); library(dplyr); library(stringr); library(tidyr)
+library(ggplot2); library(ggpubr)
+
+# SASA sheet: row 1 = description, row 2 = column headers (read_sheet handles this).
+# Columns: AA residue | AA position | Total SASA (Å²) | Total relative SASA (%) |
+#          Main-chain SASA (Å²) | Main-chain relative SASA (%) |
+#          Side-chain SASA (Å²) | Side-chain relative SASA (%) |
+#          Polar SASA (Å²) | Polar relative SASA (%) |
+#          Apolar SASA (Å²) | Apolar relative SASA (%)
+freesasa_data <- read_sheet("SASA") %>%
+  transmute(
+    from_aa = suppressWarnings(as.numeric(`AA position`)),
+    sasa    = suppressWarnings(as.numeric(`Total SASA (Å²)`))
+  ) %>%
+  filter(!is.na(from_aa), !is.na(sasa))
+
+# Load position lists for excluded functional regions
+ignore_positions <- list(
+  AS  = read_sheet("Active Site Residues")$'AA position',
+  DI  = read_sheet("Interface Residues")$'AA position',
+  MTS = 1:110
+)
+
+# Core: buried residues not in any functional region
+core_pos <- freesasa_data %>%
+  filter(sasa < 25, !from_aa %in% unlist(ignore_positions)) %>%
+  pull(from_aa)
+
+# Surface: exposed residues not in any functional region
+surface_pos <- freesasa_data %>%
+  filter(sasa > 50, !from_aa %in% unlist(ignore_positions)) %>%
+  pull(from_aa)
+
+# Load map and annotate each position with its structural context
+load_map <- function(file, label) {
+  sheet <- c(baseline = "Baseline Map", metal = "Mercury Map")[label]
+  read_sheet(sheet) %>%
+    mutate(pos = as.numeric(str_extract(hgvs_pro, "\\d+"))) %>%
+    group_by(pos) %>%
+    summarise(median_score = median(score, na.rm = TRUE), .groups = "drop") %>%
+    mutate(
+      residue_type = case_when(
+        pos %in% surface_pos          ~ "surface",
+        pos %in% core_pos             ~ "core",
+        pos %in% ignore_positions$DI  ~ "dimer interface",
+        pos %in% ignore_positions$MTS ~ "MTS",
+        pos %in% ignore_positions$AS  ~ "active site",
+        TRUE                          ~ NA_character_
+      ),
+      map_label = label
+    ) %>%
+    filter(!is.na(residue_type))
+}
+
+baseline_res <- load_map("~/Desktop/Manuscript_Data.xlsx", "baseline")
+metal_res    <- load_map("~/Desktop/Manuscript_Data.xlsx",   "metal")
+
+combined_res  <- bind_rows(baseline_res, metal_res) %>%
+  mutate(map_type = tolower(map_label))
+
+residue_levels <- c("active site","core","dimer interface","MTS","surface")
+combined_res$residue_type <- factor(combined_res$residue_type, levels = residue_levels)
+
+# All pairwise group combinations for Wilcoxon tests
+all_combinations <- expand.grid(
+  group1 = unique(combined_res$residue_type),
+  group2 = unique(combined_res$residue_type),
+  stringsAsFactors = FALSE
+)
+
+# Perform Wilcoxon for both maps across all pairs
+perform_wilcoxon_test <- function(data, combos) {
+  nested <- data %>%
+    group_by(map_label, residue_type) %>%
+    summarise(scores = list(median_score), med = median(median_score, na.rm = TRUE),
+              .groups = "drop") %>%
+    pivot_wider(names_from = map_label, values_from = c(scores, med), names_sep = "_")
+  
+  combos %>%
+    rowwise() %>%
+    mutate(
+      p_value_baseline = wilcox.test(
+        nested %>% filter(residue_type == group1) %>% pull(scores_baseline) %>% .[[1]],
+        nested %>% filter(residue_type == group2) %>% pull(scores_baseline) %>% .[[1]],
+        exact = FALSE)$p.value,
+      p_value_metal = wilcox.test(
+        nested %>% filter(residue_type == group1) %>% pull(scores_metal) %>% .[[1]],
+        nested %>% filter(residue_type == group2) %>% pull(scores_metal) %>% .[[1]],
+        exact = FALSE)$p.value,
+      diff_med_baseline = (nested %>% filter(residue_type == group1) %>% pull(med_baseline)) -
+                          (nested %>% filter(residue_type == group2) %>% pull(med_baseline)),
+      diff_med_metal    = (nested %>% filter(residue_type == group1) %>% pull(med_metal)) -
+                          (nested %>% filter(residue_type == group2) %>% pull(med_metal))
+    ) %>% ungroup()
+}
+
+wilcoxon_results <- perform_wilcoxon_test(combined_res, all_combinations)
+
+# Convert p-values to ordered significance levels (0–3)
+annotate_significance <- function(df, p_col, map_label, diff_col) {
+  df %>%
+    filter(!is.na(.data[[p_col]])) %>%
+    mutate(
+      significance = case_when(
+        .data[[p_col]] < 0.001 ~ "p < 0.001",
+        .data[[p_col]] < 0.01  ~ "p < 0.01",
+        .data[[p_col]] < 0.05  ~ "p < 0.05",
+        TRUE ~ "ns"
+      ),
+      significance_num = case_when(
+        .data[[p_col]] < 0.001 ~ 3,
+        .data[[p_col]] < 0.01  ~ 2,
+        .data[[p_col]] < 0.05  ~ 1,
+        TRUE ~ 0
+      ),
+      map_type    = map_label,
+      diff_median = .data[[diff_col]]
+    ) %>%
+    select(group1, group2, map_type, p_value = all_of(p_col), significance, significance_num, diff_median)
+}
+
+wilcoxon_results_combined <- bind_rows(
+  annotate_significance(wilcoxon_results, "p_value_baseline", "baseline", "diff_med_baseline"),
+  annotate_significance(wilcoxon_results, "p_value_metal",    "metal",    "diff_med_metal")
+)
+
+# SASA histogram with core/surface cut-off lines
+p_hist <- ggplot(freesasa_data, aes(x = sasa)) +
+  geom_histogram(binwidth = 5, fill = "grey", color = "black") +
+  geom_vline(xintercept = c(25, 50), color = c("magenta","green"), linetype = "dashed") +
+  labs(title = "freeSASA", x = "SASA (Å²)", y = "Frequency") +
+  theme_minimal(base_size = 15)
+print(p_hist)
+pdf("~/Desktop/freeSASA_histogram.pdf", width = 7, height = 6); print(p_hist); dev.off()
+
+# Significance comparisons to annotate on boxplot
+sig_comps <- list(
+  c("surface", "core"),
+  c("surface", "active site"),
+  c("core", "dimer interface")
+)
+
+ylim_max <- max(combined_res$median_score, na.rm = TRUE) + 0.75
+
+# Combined boxplot (baseline and metal side by side per structural category)
+p_combined <- ggplot(combined_res, aes(x = residue_type, y = median_score, fill = map_type)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  scale_fill_manual(values = c("baseline" = "#11EE89", "metal" = "#EE1176")) +
+  stat_compare_means(comparisons = sig_comps, method = "wilcox.test", label = "p.signif") +
+  coord_cartesian(ylim = c(0, ylim_max)) +
+  labs(x = "Residue Type", y = "Functional Score (Median)", fill = "Map Type") +
+  theme_minimal(base_size = 15)
+print(p_combined)
+pdf("~/Desktop/Combined_Baseline_Metal_Boxplot.pdf", width = 8, height = 6); print(p_combined); dev.off()
+
+# Separate boxplots per map
+for (map in c("baseline", "metal")) {
+  df_map     <- combined_res %>% filter(map_label == map)
+  fill_color <- ifelse(map == "baseline", "#11EE89", "#EE1176")
+  p <- ggplot(df_map, aes(x = residue_type, y = median_score)) +
+    geom_boxplot(outlier.shape = NA, fill = fill_color) +
+    scale_x_discrete(drop = FALSE, limits = residue_levels) +
+    stat_compare_means(comparisons = sig_comps, method = "wilcox.test", label = "p.signif") +
+    coord_cartesian(ylim = c(0, ylim_max)) +
+    labs(title = paste0(str_to_title(map), " Map"),
+         x = "Residue Type", y = "Functional Score (Median)") +
+    theme_minimal(base_size = 15)
+  pdf(paste0("~/Desktop/", str_to_title(map), "_Map_Boxplot.pdf"), width = 8, height = 6)
+  print(p); dev.off()
+}
+
+# ── Triangular heatmap ────────────────────────────────────────────────────
+# Each cell is split diagonally: upper-left = baseline, lower-right = metal.
+# Fill encodes significance level (white → light pink → red → dark red).
+heatmap_matrix <- wilcoxon_results_combined %>%
+  select(group1, group2, map_type, significance_num) %>%
+  pivot_wider(names_from = map_type, values_from = significance_num, values_fill = 0) %>%
+  rename(residue1 = group1, residue2 = group2) %>%
+  mutate(x = factor(residue1, levels = residue_levels),
+         y = factor(residue2, levels = residue_levels))
+
+heatmap_matrix$x_num <- as.numeric(heatmap_matrix$x)
+heatmap_matrix$y_num <- as.numeric(heatmap_matrix$y)
+
+# Build triangle polygon coordinates for each half of each cell
+make_triangles <- function(data, type = c("baseline","metal")) {
+  type   <- match.arg(type)
+  offset <- if (type == "baseline") list(x = c(-0.5, 0.5,-0.5), y = c( 0.5, 0.5,-0.5))
+            else                    list(x = c( 0.5,-0.5, 0.5), y = c(-0.5,-0.5, 0.5))
+  data[rep(1:nrow(data), each = 3), ] %>%
+    mutate(
+      x    = rep(data$x_num, each = 3) + rep(offset$x, times = nrow(data)),
+      y    = rep(data$y_num, each = 3) + rep(offset$y, times = nrow(data)),
+      fill = rep(data[[type]], each = 3)
+    ) %>%
+    select(x, y, fill, residue1, residue2)
+}
+
+baseline_triangles <- make_triangles(heatmap_matrix, "baseline")
+metal_triangles    <- make_triangles(heatmap_matrix, "metal")
+
+p_heatmap <- ggplot() +
+  geom_polygon(data = metal_triangles,
+               aes(x = x, y = y, group = interaction(residue1, residue2), fill = factor(fill)),
+               color = "black") +
+  geom_polygon(data = baseline_triangles,
+               aes(x = x, y = y, group = interaction(residue1, residue2), fill = factor(fill)),
+               color = "black") +
+  coord_fixed() +
+  scale_fill_manual(
+    values = c("0"="white","1"="#FFDDDD","2"="#FF8888","3"="#B20000"),
+    breaks = c("0","1","2","3"),
+    labels = c("Not Sign.","< 0.05","< 0.01","< 0.001"),
+    name   = "Significance (p.value)"
+  ) +
+  scale_x_continuous(breaks = seq_along(residue_levels), labels = residue_levels,
+                     expand = expansion(add = 0.5), position = "top") +
+  scale_y_continuous(breaks = seq_along(residue_levels), labels = residue_levels,
+                     expand = expansion(add = 0.5), trans = "reverse") +
+  labs(title = "Triangular Heatmap for Metal and Baseline") +
+  theme_minimal(base_size = 14) +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 0),
+        axis.text.y = element_text(hjust = 1),
+        panel.grid = element_blank())
+print(p_heatmap)
+pdf("~/Desktop/Triangular_Heatmap_Baseline_Metal.pdf", width = 8, height = 8)
+print(p_heatmap); dev.off()
+```
+
+
+```{r, warning=FALSE, Baseline and Metal: Impact Based on Quaternary Position: MTS}
+# =============================================================================
+# CHUNK 12 — MTS Region Structure Analysis
+#
+# Focuses specifically on the mitochondrial targeting sequence (MTS, residues
+# 1–110) and its sub-features:
+#   • TOM20 motif   : residues 12, 14, 15 — receptor binding
+#   • Amphipathic helix: 75–93
+#   • MPP cleavage motif: 36–40 (matrix processing peptidase recognition)
+#   • Mature N-termini:  109–111
+#   • Surface / dimer interface from SASA (excluded from MTS-specific analysis)
+#
+# Tests whether these MTS sub-features show distinct functional score
+# distributions compared to surface positions.
+# =============================================================================
+
+# SASA sheet: row 1 = description, row 2 = column headers (read_sheet handles this).
+freesasa_data <- read_sheet("SASA") %>%
+  transmute(
+    from_aa = suppressWarnings(as.numeric(`AA position`)),
+    sasa    = suppressWarnings(as.numeric(`Total SASA (Å²)`))
+  ) %>%
+  filter(!is.na(from_aa), !is.na(sasa))
+
+ignore_positions <- list(
+  AS  = read_sheet("Active Site Residues")$'AA position',  # was $AA — column is "AA position"
+  DI  = read_sheet("Interface Residues")$'AA position',    # was $AA — column is "AA position"
+  MTS = 1:110
+)
+
+surface_positions <- freesasa_data %>%
+  filter(sasa > 50, !from_aa %in% unlist(ignore_positions)) %>%
+  pull(from_aa)
+
+# Load map and extract position, WT amino acid, and median score per position
+load_and_process_map <- function(file, sheet, map_type) {
+  read_sheet(sheet) %>%
+    mutate(
+      pos        = as.numeric(gsub("p\\.([A-Za-z]+)([0-9]+)([A-Za-z]+)", "\\2", hgvs_pro)),
+      mutated_aa = gsub("p\\.([A-Za-z]+)([0-9]+)([A-Za-z]+)", "\\1", hgvs_pro),
+      map_type   = map_type
+    ) %>%
+    group_by(pos) %>%
+    mutate(median_score = median(score, na.rm = TRUE)) %>%
+    select(pos, mutated_aa, map_type, median_score)
+}
+
+baseline_data <- load_and_process_map("~/Desktop/Manuscript_Data.xlsx", "Baseline Map", "baseline")
+metal_data    <- load_and_process_map("~/Desktop/Manuscript_Data.xlsx",   "Mercury Map",  "metal")
+
+combined_data <- bind_rows(baseline_data, metal_data) %>%
+  distinct() %>%
+  filter(!is.na(pos) & !is.na(mutated_aa) & !is.na(median_score))
+
+# Define MTS sub-feature position sets
+TOM20motif_positions  <- c(12, 14, 15)
+amphipathicHelix      <- 75:93
+Ntermini_positions    <- 109:111
+MPP_positions         <- 36:40
+
+# Annotate positions with MTS sub-feature labels
+residue_data <- combined_data %>%
+  mutate(
+    residue_type = case_when(
+      pos %in% surface_positions        ~ "surface",
+      pos %in% ignore_positions$DI      ~ "dimer interface",
+      pos %in% TOM20motif_positions     ~ "TOM20",
+      pos %in% MPP_positions            ~ "MPP motif",
+      pos %in% amphipathicHelix         ~ "helix",
+      pos %in% Ntermini_positions       ~ "N-termini",
+      TRUE                              ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(residue_type)) %>%
+  mutate(residue_type = factor(residue_type,
+                               levels = c("surface","dimer interface","TOM20","MPP motif","helix","N-termini")))
+
+MTS_boxplot <- ggplot(residue_data, aes(x = residue_type, y = median_score, fill = map_type)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75)) +
+  scale_x_discrete(labels = c(
+    "surface"         = "surface",
+    "dimer interface" = "dimer interface",
+    "TOM20"           = "TOM20",
+    "MPP motif"       = "MPP motif",
+    "helix"           = "α-helix",
+    "N-termini"       = "Mature \nN-termini"
+  )) +
+  scale_fill_manual(values = c("baseline" = "#11EE89", "metal" = "#EE1176")) +
+  labs(x = "residue type/pos", y = "functional score (median)") +
+  theme_minimal()
+
+pdf("~/Desktop/MTS_boxplots.pdf", width = 8, height = 8); print(MTS_boxplot); dev.off()
+print(MTS_boxplot)
+
+# Pairwise Wilcoxon tests for MTS sub-features
+all_combinations <- expand.grid(
+  group1 = unique(residue_data$residue_type),
+  group2 = unique(residue_data$residue_type),
+  stringsAsFactors = FALSE
+)
+
+perform_wilcoxon_test <- function(residue_data, all_combinations) {
+  nested_data <- residue_data %>%
+    group_by(map_type, residue_type) %>%
+    summarise(scores = list(median_score), .groups = "drop") %>%
+    pivot_wider(names_from = map_type, values_from = scores)
+  
+  wilcoxon_if_possible <- function(x, y) {
+    if (length(x) >= 2 && length(y) >= 2) wilcox.test(x, y, exact = FALSE)$p.value else NA
+  }
+  
+  all_combinations %>%
+    rowwise() %>%
+    mutate(
+      p_value_baseline = {
+        x <- nested_data %>% filter(residue_type == group1) %>% pull(baseline) %>% .[[1]]
+        y <- nested_data %>% filter(residue_type == group2) %>% pull(baseline) %>% .[[1]]
+        wilcoxon_if_possible(x %||% numeric(0), y %||% numeric(0))
+      },
+      p_value_metal = {
+        x <- nested_data %>% filter(residue_type == group1) %>% pull(metal) %>% .[[1]]
+        y <- nested_data %>% filter(residue_type == group2) %>% pull(metal) %>% .[[1]]
+        wilcoxon_if_possible(x %||% numeric(0), y %||% numeric(0))
+      }
+    ) %>% ungroup()
+}
+
+wilcoxon_results <- perform_wilcoxon_test(residue_data, all_combinations)
+
+annotate_significance <- function(df, p_col, map_label) {
+  df %>%
+    filter(!is.na(.data[[p_col]])) %>%
+    mutate(
+      significance = case_when(
+        .data[[p_col]] < 0.001 ~ "p < 0.001",
+        .data[[p_col]] < 0.01  ~ "p < 0.01",
+        .data[[p_col]] < 0.05  ~ "p < 0.05",
+        TRUE ~ "ns"
+      ),
+      significance_num = case_when(
+        .data[[p_col]] < 0.001 ~ 3,
+        .data[[p_col]] < 0.01  ~ 2,
+        .data[[p_col]] < 0.05  ~ 1,
+        TRUE ~ 0
+      ),
+      map_type = map_label
+    ) %>%
+    select(group1, group2, map_type, p_value = all_of(p_col), significance, significance_num)
+}
+
+wilcoxon_results_combined <- bind_rows(
+  annotate_significance(wilcoxon_results, "p_value_baseline", "baseline"),
+  annotate_significance(wilcoxon_results, "p_value_metal",    "metal")
+)
+
+# Reshape for triangular heatmap
+heatmap_matrix <- wilcoxon_results_combined %>%
+  select(group1, group2, map_type, significance_num) %>%
+  pivot_wider(names_from = map_type, values_from = significance_num, values_fill = 0) %>%
+  rename(residue1 = group1, residue2 = group2) %>%
+  mutate(x = factor(residue1), y = factor(residue2))
+
+heatmap_matrix$x_num <- as.numeric(heatmap_matrix$x)
+heatmap_matrix$y_num <- as.numeric(heatmap_matrix$y)
+
+make_triangles <- function(data, type = c("baseline","metal")) {
+  type   <- match.arg(type)
+  offset <- if (type == "baseline") list(x = c(-0.5, 0.5,-0.5), y = c( 0.5, 0.5,-0.5))
+            else                    list(x = c( 0.5,-0.5, 0.5), y = c(-0.5,-0.5, 0.5))
+  data[rep(1:nrow(data), each = 3), ] %>%
+    mutate(
+      x    = rep(data$x_num, each = 3) + rep(offset$x, times = nrow(data)),
+      y    = rep(data$y_num, each = 3) + rep(offset$y, times = nrow(data)),
+      fill = rep(data[[type]], each = 3)
+    ) %>%
+    select(x, y, fill, residue1, residue2)
+}
+
+baseline_triangles <- make_triangles(heatmap_matrix, "baseline")
+metal_triangles    <- make_triangles(heatmap_matrix, "metal")
+baseline_triangles$fill <- as.numeric(baseline_triangles$fill)
+metal_triangles$fill    <- as.numeric(metal_triangles$fill)
+
+residue_levels <- factor(
+  unique(c(as.character(baseline_triangles$residue1), as.character(metal_triangles$residue1))),
+  levels = c("surface","dimer interface","TOM20","MPP motif","helix","N-termini")
+)
+
+baseline_triangles <- baseline_triangles %>%
+  mutate(residue1 = factor(residue1, levels = residue_levels),
+         residue2 = factor(residue2, levels = residue_levels))
+metal_triangles <- metal_triangles %>%
+  mutate(residue1 = factor(residue1, levels = residue_levels),
+         residue2 = factor(residue2, levels = residue_levels))
+
+MTS_Heatmap <- ggplot() +
+  geom_polygon(data = metal_triangles,
+               aes(x = x, y = y, group = interaction(residue1, residue2), fill = factor(fill)),
+               color = "black", size = 0.5) +
+  geom_polygon(data = baseline_triangles,
+               aes(x = x, y = y, group = interaction(residue1, residue2), fill = factor(fill)),
+               color = "black", size = 0.5) +
+  coord_fixed() +
+  scale_fill_manual(
+    values = c("0"="white","1"="#FFDDDD","2"="#FF8888","3"="#B20000"),
+    breaks = c("0","1","2","3"),
+    labels = c("Not Sign.","< 0.05","< 0.01","< 0.001"),
+    name   = "Significance (p.value)"
+  ) +
+  scale_x_discrete(limits = levels(residue_levels), labels = levels(residue_levels)) +
+  scale_y_discrete(limits = levels(residue_levels), labels = levels(residue_levels)) +
+  geom_text(data = data.frame(x = levels(residue_levels),
+                               y = rep(-2, length(levels(residue_levels)))),
+            aes(x = x, y = y, label = x), size = 4, color = "black", angle = 90, hjust = 0) +
+  geom_text(data = data.frame(x = rep(-2, length(levels(residue_levels))),
+                               y = levels(residue_levels)),
+            aes(x = x, y = y, label = y), size = 4, color = "black", angle = 0, hjust = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(),
+        panel.grid = element_blank(),
+        legend.key = element_rect(fill = "white", color = "black")) +
+  labs(title = "Triangular Heatmap for Metal and Baseline",
+       x = "Residue Type", y = "Residue Type", fill = "Significance")
+
+pdf("~/Desktop/Heatmap_MTS.pdf", width = 8, height = 8); print(MTS_Heatmap); dev.off()
+print(MTS_Heatmap)
+
+# Print pairwise comparisons of specific groups for both maps
+print_comparison <- function(data, map_label, group1, group2) {
+  scores1 <- data %>% filter(map_type == map_label, residue_type == group1) %>% pull(median_score)
+  scores2 <- data %>% filter(map_type == map_label, residue_type == group2) %>% pull(median_score)
+  cat(sprintf("\n%s map - %s group size: %d\n", map_label, group1, length(scores1)))
+  cat(sprintf("%s map - %s group size: %d\n", map_label, group2, length(scores2)))
+  median_diff <- median(scores1, na.rm = TRUE) - median(scores2, na.rm = TRUE)
+  wilcox_res  <- wilcox.test(scores1, scores2, exact = FALSE)
+  cat(sprintf("%s map comparison: %s vs %s\n", toupper(map_label), group1, group2))
+  cat(sprintf("Difference in median functional scores: %.4f\n", median_diff))
+  cat(sprintf("Wilcoxon test p-value: %.4g\n", wilcox_res$p.value))
+}
+
+print_comparison(residue_data, "baseline", "helix", "surface")
+print_comparison(residue_data, "metal",    "helix", "surface")
+```
+
+
+```{r, warning=FALSE, Substitution Resulting in Negative Charge for Second Decarboxylation Residues}
+# =============================================================================
+# CHUNK 13 — Negative-Charge Substitutions at Second Decarboxylation Residues
+#
+# CPOX catalyses two sequential decarboxylation reactions. Residues involved
+# in each reaction occupy distinct spatial positions:
+#   set1 (400–404): second decarboxylation substrate-binding residues
+#   set2 (407, 411, 413, 416): second set
+#
+# This chunk tests whether substitutions TO negatively charged amino acids
+# (Asp/Glu) at these specific residue sets are significantly more disruptive
+# than:
+#   1) All other substitutions at other positions (regardless of AA type)
+#   2) TO negative-charge substitutions at all other positions
+#
+# One-tailed Wilcoxon (alternative = "less") tests whether target scores
+# are lower than the comparison group.
+# =============================================================================
+
+library(data.table); library(stringr); library(ggplot2); library(ggpubr)
+
+baseline <- read_sheet("Baseline Map")
+setDT(baseline)
+metal    <- read_sheet("Mercury Map")
+setDT(metal)
+
+aa_cats_detailed <- list(
+  hydrophobic = c("Ala","Gly","Val","Leu","Ile","Met","Phe","Trp","Tyr"),
+  polar       = c("Ser","Thr","Asn","Gln","Cys"),
+  neg_charged = c("Asp","Glu"),
+  pos_charged = c("Arg","Lys","His"),
+  proline     = c("Pro")
+)
+
+# Lookup table: map each AA to its physicochemical class
+aa_lookup <- rbindlist(
+  lapply(names(aa_cats_detailed), function(cat) {
+    data.table(changeTo = aa_cats_detailed[[cat]], aa_type_To_simple = cat)
+  })
+)
+
+set1 <- 400:404      # first decarboxylation residue set
+set2 <- c(407, 411, 413, 416)  # second set
+
+# Main analysis function: two comparisons per dataset × target set
+#   Comparison 1: neg-charged @ target vs. all other substitutions
+#   Comparison 2: neg-charged @ target vs. neg-charged at all other positions
+process_neg_target_vs_all <- function(df, target_set, exclude_set,
+                                       dataset_name = "dataset",
+                                       pdf_file_prefix = NULL) {
+  setDT(df)
+  df[, pos      := as.numeric(str_extract(hgvs_pro, "\\d+"))]
+  df[, changeTo := str_extract(hgvs_pro, "(?<=\\d)[A-Z][a-z]{2}$")]
+  df <- merge(df, aa_lookup, by = "changeTo", all.x = TRUE)
+  
+  # Comparison 1: target neg-charged vs. all other (any type, any position)
+  neg_target_all <- df[pos %in% target_set & aa_type_To_simple == "neg_charged"]
+  all_others_all <- df[!(pos %in% target_set & aa_type_To_simple == "neg_charged") &
+                         !(pos %in% exclude_set & aa_type_To_simple == "neg_charged")]
+  
+  data_all <- rbind(copy(neg_target_all)[, group := "neg_target"],
+                    copy(all_others_all)[, group := "all_other"])
+  data_all[, group := factor(group, levels = c("neg_target","all_other"))]
+  
+  medians_all    <- data_all[, .(median_score = median(score, na.rm = TRUE)), by = group]
+  median_diff_all <- medians_all[group == "neg_target", median_score] -
+                     medians_all[group == "all_other",  median_score]
+  test_all <- wilcox.test(score ~ group, data = data_all, alternative = "less", exact = FALSE)
+  
+  if (!is.null(pdf_file_prefix)) {
+    p_all <- ggplot(data_all, aes(x = group, y = score)) +
+      geom_boxplot(outlier.size = 0.3) +
+      labs(title = paste0(dataset_name, ": neg-charged @ ",
+                          paste(target_set, collapse = ","), " vs all other residues"),
+           x = "Group", y = "Variant functional score") +
+      theme_minimal(base_size = 16) +
+      stat_compare_means(method = "wilcox.test", label = "p.signif")
+    ggsave(paste0(pdf_file_prefix, "_all_substitutions.pdf"), p_all, width = 6, height = 6)
+  }
+  
+  # Comparison 2: target neg-charged vs. neg-charged at all other positions
+  neg_target_neg <- df[pos %in% target_set & aa_type_To_simple == "neg_charged"]
+  neg_other_neg  <- df[pos %notin% target_set & aa_type_To_simple == "neg_charged"]
+  
+  data_neg <- rbind(copy(neg_target_neg)[, group := "neg_target"],
+                    copy(neg_other_neg)[,  group := "neg_other"])
+  data_neg[, group := factor(group, levels = c("neg_target","neg_other"))]
+  
+  medians_neg    <- data_neg[, .(median_score = median(score, na.rm = TRUE)), by = group]
+  median_diff_neg <- medians_neg[group == "neg_target", median_score] -
+                     medians_neg[group == "neg_other",  median_score]
+  test_neg <- wilcox.test(score ~ group, data = data_neg, alternative = "less", exact = FALSE)
+  
+  if (!is.null(pdf_file_prefix)) {
+    p_neg <- ggplot(data_neg, aes(x = group, y = score)) +
+      geom_boxplot(outlier.size = 0.3) +
+      labs(title = paste0(dataset_name, ": neg-charged @ ",
+                          paste(target_set, collapse = ","), " vs all other TO negative"),
+           x = "Group", y = "Variant functional score") +
+      theme_minimal(base_size = 16) +
+      stat_compare_means(method = "wilcox.test", label = "p.signif")
+    ggsave(paste0(pdf_file_prefix, "_neg_only.pdf"), p_neg, width = 6, height = 6)
+  }
+  
+  list(dataset = dataset_name, target = paste(target_set, collapse = ","),
+       median_diff_all = median_diff_all, p_value_all = test_all$p.value,
+       median_diff_neg = median_diff_neg, p_value_neg = test_neg$p.value)
+}
+
+res1 <- process_neg_target_vs_all(baseline, set1, set2, "baseline_set1", "~/Desktop/baseline_set1")
+res2 <- process_neg_target_vs_all(baseline, set2, set1, "baseline_set2", "~/Desktop/baseline_set2")
+res3 <- process_neg_target_vs_all(metal,    set1, set2, "metal_set1",    "~/Desktop/metal_set1")
+res4 <- process_neg_target_vs_all(metal,    set2, set1, "metal_set2",    "~/Desktop/metal_set2")
+
+for (r in list(res1, res2, res3, res4)) {
+  cat("\nDataset:", r$dataset,
+      "\nTarget positions:", r$target,
+      "\nMedian difference (vs all other substitutions):", round(r$median_diff_all, 4),
+      "\nOne-tailed Wilcoxon p (vs all other substitutions):", signif(r$p_value_all, 4),
+      "\nMedian difference (vs all other TO negative):", round(r$median_diff_neg, 4),
+      "\nOne-tailed Wilcoxon p (vs all other TO negative):", signif(r$p_value_neg, 4),
+      "\n----------------------------------------------\n")
+}
+```
+
+
+```{r, warning=FALSE, Impact of AA substitution and Substrate Preference with Hg}
+# =============================================================================
+# CHUNK 14 — Delta Score Impact Classification (APR / Improved / Known)
+#
+# Classifies variants by their response to mercury (Hg) exposure using
+# delta scores (baseline – metal):
+#
+#   APR (activity reduced in presence of Hg):
+#     • Significant delta (p < threshold)
+#     • Negative deltaScore (function lost under metal)
+#     • Tolerated at baseline (lower CI ≥ 0.5)
+#
+#   Improved (Hg-rescued):
+#     • Significant delta
+#     • Positive deltaScore (function gained under metal)
+#     • Tolerated at baseline
+#
+#   Known (no significant delta):
+#     • Not significant but tolerated at baseline
+#
+#   Neutral: all other variants
+#
+# Produces violin + boxplot distributions with APR variants highlighted,
+# relative to a null band derived from synonymous + nonsense delta scores.
+# =============================================================================
+
+delta <- read_sheet("Delta Map")
+setDT(delta)
+delta <- delta[is.finite(deltaScore) & is.finite(deltaSE)]
+
+# Classify variant types
+delta[, variant_type  := "Missense"]
+delta[grepl("Ter$", hgvs_pro), variant_type := "Nonsense"]
+delta[grepl("=$",   hgvs_pro), variant_type := "Synonymous"]
+delta[, variant_group := variant_type]
+delta[variant_type %in% c("Synonymous","Nonsense"), variant_group := "Synonymous + Nonsense"]
+
+# Load baseline scores and define tolerance threshold
+baseline_map <- read_sheet("Baseline Map")
+setDT(baseline_map)
+setnames(baseline_map, colnames(baseline_map)[1:4], c("hgvs_pro","baseline_score","se","df"))
+baseline_map[, baseline_lower := baseline_score + se]
+
+baseline_miss          <- !grepl("Ter$|=$", baseline_map$hgvs_pro)
+baseline_miss_tolerated <- baseline_map[baseline_miss & baseline_lower >= 0.5, hgvs_pro]
+
+# Assign impact categories
+delta[, Impact := "neutral"]
+APR_set      <- delta[significant == TRUE  & deltaScore < 0 & hgvs_pro %in% baseline_miss_tolerated, hgvs_pro]
+Improved_set <- delta[significant == TRUE  & deltaScore > 0 & hgvs_pro %in% baseline_miss_tolerated, hgvs_pro]
+Known_set    <- delta[significant == FALSE & hgvs_pro %in% baseline_miss_tolerated, hgvs_pro]
+
+delta[hgvs_pro %in% APR_set,      Impact := "APR"]
+delta[hgvs_pro %in% Improved_set, Impact := "Improved"]
+delta[hgvs_pro %in% Known_set,    Impact := "Known"]
+
+# Export impact classification for PyMOL structural colouring
+color <- delta[, .(hgvs_pro, Impact)]
+color[, score := NA_real_]
+color[Impact == "Improved", score := 2]
+color[Impact == "neutral",  score := 1.1]
+color[Impact == "APR",      score := 0.6]
+color[Impact == "Known",    score := 0]
+color[, se  := 0]
+color[, pos := as.numeric(str_extract(hgvs_pro, "[0-9]+"))]
+write.csv(color[, .(hgvs_pro, score, se)], "~/Desktop/CPOX_delta_structure.csv", row.names = FALSE)
+
+# Null distribution: synonymous + nonsense delta scores
+null_variants <- delta[variant_group == "Synonymous + Nonsense"]
+null_median   <- median(null_variants$deltaScore, na.rm = TRUE)
+null_se       <- sd(null_variants$deltaScore, na.rm = TRUE) / sqrt(nrow(null_variants))
+null_lower    <- null_median - 1.96 * null_se
+null_upper    <- null_median + 1.96 * null_se
+
+# Violin + boxplot with APR variants highlighted as red points
+p <- ggplot(delta, aes(x = variant_group, y = deltaScore)) +
+  geom_violin(data = subset(delta, variant_group != "Missense"),
+              fill = "grey85", color = "grey40", width = 0.9) +
+  geom_violin(data = subset(delta, variant_group == "Missense"),
+              fill = "lightblue", color = "grey40", width = 0.9) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white") +
+  # Shaded null band (95% CI of synonymous + nonsense median)
+  geom_rect(
+    data = data.frame(xmin = 0.5, xmax = 2.5, ymin = null_lower, ymax = null_upper),
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    fill = "grey80", alpha = 0.2, inherit.aes = FALSE
+  ) +
+  geom_hline(yintercept = null_median, linetype = "dashed") +
+  geom_hline(yintercept = 0,           linetype = "dotted") +
+  # APR variants as filled red circles
+  geom_point(
+    data = subset(delta, variant_group == "Missense"),
+    aes(fill = Impact == "APR"), shape = 21, color = "black", size = 2.5
+  ) +
+  scale_fill_manual(values = c("FALSE" = "white", "TRUE" = "red"), guide = "none") +
+  labs(x = NULL, y = "Delta functional score (baseline – mercury)",
+       title = "Delta score distributions with APR variants highlighted") +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 11), axis.title.y = element_text(size = 12))
+print(p)
+
+pdf("~/Desktop/APRdistribution.pdf", width = 8, height = 6); print(p); dev.off()
+
+# Summary statistics
+total_baseline_miss <- length(baseline_miss_tolerated)
+num_APR             <- sum(delta$Impact == "APR", na.rm = TRUE)
+percent_APR         <- 100 * num_APR / total_baseline_miss
+total_missense      <- sum(delta$variant_type == "Missense")
+num_negative        <- sum(delta$deltaScore < 0 & delta$variant_type == "Missense", na.rm = TRUE)
+
+cat(sprintf("APR variants (baseline tolerated, significant negative delta): %d / %d (%.2f%%)\n",
+            num_APR, total_baseline_miss, percent_APR))
+cat(sprintf("Percentage of missense variants with negative deltaScore: %.2f%%\n",
+            100 * num_negative / total_missense))
+
+# Wilcoxon test: all missense delta scores vs. null (synonymous + nonsense)
+missense_scores <- delta[variant_type == "Missense", deltaScore]
+null_scores     <- delta[variant_group == "Synonymous + Nonsense", deltaScore]
+wilcox_all_vs_null <- wilcox.test(missense_scores, null_scores, alternative = "two.sided")
+
+cat(sprintf("Median deltaScore (Missense): %.3f\n", median(missense_scores, na.rm = TRUE)))
+cat(sprintf("Median deltaScore (Null: Synonymous + Nonsense): %.3f\n", median(null_scores, na.rm = TRUE)))
+print(wilcox_all_vs_null)
+```
+
+```{r, warning=FALSE, SNV Accessibility and Mercury Impact}
+# =============================================================================
+# CHUNK 14b — SNV Accessibility and Mercury Impact
+#
+# This analysis determines:
+# 1. Which amino acid substitutions are SNV-reachable (single nucleotide 
+#    variant accessible based on the genetic code)
+# 2. Of those SNV-reachable substitutions, what fraction show statistically 
+#    significant mercury effect
+# Output: Percentage of SNV-accessible substitutions with mercury impact
+# Data source: "Delta Map" sheet from Manuscript_Data.xlsx
+# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 1: Build SNV Reachability Matrix
+# ─────────────────────────────────────────────────────────────────────────
+# The genetic code: all codons and their amino acids
+
+genetic_code <- list(
+  "TTT" = "Phe", "TTC" = "Phe", "TTA" = "Leu", "TTG" = "Leu",
+  "TCT" = "Ser", "TCC" = "Ser", "TCA" = "Ser", "TCG" = "Ser",
+  "TAT" = "Tyr", "TAC" = "Tyr", "TAA" = "STOP", "TAG" = "STOP",
+  "TGT" = "Cys", "TGC" = "Cys", "TGA" = "STOP", "TGG" = "Trp",
+  "CTT" = "Leu", "CTC" = "Leu", "CTA" = "Leu", "CTG" = "Leu",
+  "CCT" = "Pro", "CCC" = "Pro", "CCA" = "Pro", "CCG" = "Pro",
+  "CAT" = "His", "CAC" = "His", "CAA" = "Gln", "CAG" = "Gln",
+  "CGT" = "Arg", "CGC" = "Arg", "CGA" = "Arg", "CGG" = "Arg",
+  "ATT" = "Ile", "ATC" = "Ile", "ATA" = "Ile", "ATG" = "Met",
+  "ACT" = "Thr", "ACC" = "Thr", "ACA" = "Thr", "ACG" = "Thr",
+  "AAT" = "Asn", "AAC" = "Asn", "AAA" = "Lys", "AAG" = "Lys",
+  "AGT" = "Ser", "AGC" = "Ser", "AGA" = "Arg", "AGG" = "Arg",
+  "GTT" = "Val", "GTC" = "Val", "GTA" = "Val", "GTG" = "Val",
+  "GCT" = "Ala", "GCC" = "Ala", "GCA" = "Ala", "GCG" = "Ala",
+  "GAT" = "Asp", "GAC" = "Asp", "GAA" = "Glu", "GAG" = "Glu",
+  "GGT" = "Gly", "GGC" = "Gly", "GGA" = "Gly", "GGG" = "Gly"
+)
+
+# Function: Check if two codons differ by exactly 1 nucleotide
+codons_differ_by_one <- function(codon1, codon2) {
+  if (nchar(codon1) != 3 || nchar(codon2) != 3) return(FALSE)
+  
+  diffs <- 0
+  for (pos in 1:3) {
+    if (substr(codon1, pos, pos) != substr(codon2, pos, pos)) {
+      diffs <- diffs + 1
+    }
+  }
+  
+  return(diffs == 1)
+}
+
+# Function: Check if an amino acid pair is SNV-reachable
+# Input: from_aa, to_aa (3-letter codes, e.g., "Ala", "Arg")
+# Output: TRUE if ANY codon pair differs by exactly 1 nucleotide
+is_snv_reachable_pair <- function(from_aa, to_aa) {
+  
+  # Get all codons for FROM and TO amino acids
+  from_codons <- names(genetic_code[which(genetic_code == from_aa)])
+  to_codons <- names(genetic_code[which(genetic_code == to_aa)])
+  
+  # If either amino acid doesn't exist in genetic code, return FALSE
+  if (length(from_codons) == 0 || length(to_codons) == 0) {
+    return(FALSE)
+  }
+  
+  # Test every FROM codon against every TO codon
+  # If ANY pair differs by exactly 1 nucleotide, return TRUE
+  for (from_codon in from_codons) {
+    for (to_codon in to_codons) {
+      if (codons_differ_by_one(from_codon, to_codon)) {
+        return(TRUE)
+      }
+    }
+  }
+  
+  # No SNV path found between any codon pairs
+  return(FALSE)
+}
+
+# Pre-compute SNV reachability for all amino acid pairs
+# This lookup table lets us quickly determine if any given substitution
+# can be created with a single nucleotide change
+
+cat("Building SNV reachability matrix...\n")
+
+snv_reachable_pairs <- data.frame()
+
+all_aa <- unique(unlist(genetic_code))
+all_aa <- all_aa[all_aa != "STOP"]
+
+# Test every FROM → TO pair (20 × 19 = 380 combinations)
+for (from_aa in all_aa) {
+  for (to_aa in all_aa) {
+    if (from_aa != to_aa) {
+      is_reachable <- is_snv_reachable_pair(from_aa, to_aa)
+      snv_reachable_pairs <- rbind(snv_reachable_pairs, data.frame(
+        from_aa = from_aa,
+        to_aa = to_aa,
+        is_snv_reachable = is_reachable,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+}
+
+# Summary of reachability
+reachable_count <- sum(snv_reachable_pairs$is_snv_reachable)
+cat(sprintf("SNV Reachability Matrix Built:\n"))
+cat(sprintf("  Total amino acid pairs tested: %d\n", nrow(snv_reachable_pairs)))
+cat(sprintf("  SNV-reachable pairs: %d (%.1f%%)\n", reachable_count,
+            100 * reachable_count / nrow(snv_reachable_pairs)))
+cat("\n")
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART 2: Load Delta Data from Excel
+# ─────────────────────────────────────────────────────────────────────────
+# Read the "Delta Map" sheet from Manuscript_Data.xlsx
+# This sheet contains all variants with their environmental impact scores
+# (significant column) and delta scores
+
+delta_complete <- read_excel("~/Desktop/Manuscript_Data.xlsx", 
+                              sheet = "Delta Map",
+                              skip = 1) %>%  # Skip the description row
+  as.data.table()
+setDT(delta_complete)
+
+# Ensure numeric columns are actually numeric
+delta_complete[, `:=`(
+  deltaScore = as.numeric(deltaScore),
+  deltaSE = as.numeric(deltaSE),
+  significant = as.logical(significant)
+)]
+
+cat(sprintf("Loaded Delta Map sheet: %d rows\n", nrow(delta_complete)))
+cat("\n")
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART 3: Parse HGVS Notation to Extract Amino Acids
+# ─────────────────────────────────────────────────────────────────────────
+# HGVS format: p.XxxnnYyy
+#   Xxx = FROM amino acid (3-letter code)
+#   nn = position number
+#   Yyy = TO amino acid (3-letter code, or Ter for nonsense, or = for synonymous)
+#
+# Example: p.Ala110Arg means Alanine at position 110 → Arginine
+
+delta_complete[, `:=`(
+  from_aa = NA_character_,
+  to_aa = NA_character_,
+  position = NA_integer_,
+  is_synonymous = FALSE,
+  is_nonsense = FALSE
+)]
+
+# Function to parse HGVS and extract amino acid info
+parse_hgvs_protein <- function(hgvs_str) {
+  # Handle synonymous (p.Ala110=)
+  if (grepl("=$", hgvs_str)) {
+    from_aa <- regmatches(hgvs_str, regexpr("[A-Z][a-z]{2}", hgvs_str))
+    pos <- regmatches(hgvs_str, regexpr("\\d+", hgvs_str))
+    return(list(from = from_aa, to = from_aa, pos = as.numeric(pos), 
+                is_syn = TRUE, is_stop = FALSE))
+  }
+  
+  # Handle nonsense (p.Ala110Ter)
+  if (grepl("Ter$", hgvs_str)) {
+    from_aa <- regmatches(hgvs_str, regexpr("[A-Z][a-z]{2}(?=\\d)", hgvs_str, perl = TRUE))
+    pos <- regmatches(hgvs_str, regexpr("\\d+(?=[A-Z])", hgvs_str, perl = TRUE))
+    return(list(from = from_aa, to = "Ter", pos = as.numeric(pos),
+                is_syn = FALSE, is_stop = TRUE))
+  }
+  
+  # Handle missense (p.Ala110Arg)
+  from_aa <- regmatches(hgvs_str, regexpr("[A-Z][a-z]{2}(?=\\d)", hgvs_str, perl = TRUE))
+  pos <- regmatches(hgvs_str, regexpr("\\d+(?=[A-Z])", hgvs_str, perl = TRUE))
+  to_aa <- regmatches(hgvs_str, regexpr("[A-Z][a-z]{2}$", hgvs_str, perl = TRUE))
+  
+  return(list(from = from_aa, to = to_aa, pos = as.numeric(pos),
+              is_syn = FALSE, is_stop = FALSE))
+}
+
+# Apply parsing to all variants
+for (i in 1:nrow(delta_complete)) {
+  parsed <- parse_hgvs_protein(delta_complete[i, hgvs_pro])
+  delta_complete[i, `:=`(
+    from_aa = parsed$from,
+    to_aa = parsed$to,
+    position = parsed$pos,
+    is_synonymous = parsed$is_syn,
+    is_nonsense = parsed$is_stop
+  )]
+}
+
+cat(sprintf("Parsed HGVS notation for all %d variants\n", nrow(delta_complete)))
+cat("\n")
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART 4: Classify SNV Reachability
+# ─────────────────────────────────────────────────────────────────────────
+# For each missense variant:
+#   1. Extract FROM and TO amino acids
+#   2. Look up in SNV reachability table
+#   3. Mark as SNV-reachable if ANY codon pair could differ by 1 SNV
+
+delta_complete[, is_snv_reachable := FALSE]
+
+for (i in 1:nrow(delta_complete)) {
+  from_aa <- delta_complete[i, from_aa]
+  to_aa <- delta_complete[i, to_aa]
+  
+  # Only classify missense variants (not synonymous or nonsense)
+  if (!is.na(from_aa) && !is.na(to_aa) && 
+      from_aa != to_aa && 
+      to_aa != "Ter" &&
+      !delta_complete[i, is_synonymous] &&
+      !delta_complete[i, is_nonsense]) {
+    
+    # Look up reachability in pre-computed table
+    match <- snv_reachable_pairs[snv_reachable_pairs$from_aa == from_aa &
+                                   snv_reachable_pairs$to_aa == to_aa, ]
+    
+    if (nrow(match) > 0 && match$is_snv_reachable[1]) {
+      delta_complete[i, is_snv_reachable := TRUE]
+    }
+  }
+}
+
+cat("SNV reachability classified for all variants\n")
+cat("\n")
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART 5: Calculate Environmental Impact Statistics
+# ─────────────────────────────────────────────────────────────────────────
+
+# Count total SNV-reachable missense variants
+total_snv_reachable <- sum(delta_complete[, is_snv_reachable], na.rm = TRUE)
+
+# Count SNV-reachable variants with SIGNIFICANT environmental impact
+# (significant == TRUE means mercury effect is statistically significant)
+snv_with_significant_impact <- sum(
+  delta_complete[is_snv_reachable == TRUE & significant == TRUE, .N]
+)
+
+# Calculate percentage
+pct_snv_with_impact <- if (total_snv_reachable > 0) {
+  100 * snv_with_significant_impact / total_snv_reachable
+} else {
+  NA_real_
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART 6: Print Summary Statistics
+# ─────────────────────────────────────────────────────────────────────────
+
+cat("=================================================================\n")
+cat("SNV ACCESSIBILITY AND ENVIRONMENTAL IMPACT ANALYSIS\n")
+cat("=================================================================\n\n")
+
+# Overall variant counts
+total_variants <- nrow(delta_complete)
+missense_count <- sum(!delta_complete[, is_synonymous] & 
+                      !delta_complete[, is_nonsense], na.rm = TRUE)
+synonymous_count <- sum(delta_complete[, is_synonymous], na.rm = TRUE)
+nonsense_count <- sum(delta_complete[, is_nonsense], na.rm = TRUE)
+
+cat("VARIANT TYPE DISTRIBUTION:\n")
+cat(sprintf("  Total variants in delta data: %d\n", total_variants))
+cat(sprintf("  Missense variants: %d (%.1f%%)\n", missense_count, 
+            100 * missense_count / total_variants))
+cat(sprintf("  Synonymous variants: %d (%.1f%%)\n", synonymous_count, 
+            100 * synonymous_count / total_variants))
+cat(sprintf("  Nonsense variants: %d (%.1f%%)\n", nonsense_count, 
+            100 * nonsense_count / total_variants))
+cat("\n")
+
+# SNV reachability statistics
+cat("SNV REACHABILITY (among missense variants):\n")
+cat(sprintf("  SNV-reachable substitutions: %d / %d (%.1f%%)\n",
+            total_snv_reachable, missense_count,
+            100 * total_snv_reachable / missense_count))
+cat(sprintf("  Non-SNV-reachable substitutions: %d / %d (%.1f%%)\n",
+            missense_count - total_snv_reachable, missense_count,
+            100 * (missense_count - total_snv_reachable) / missense_count))
+cat("\n")
+
+# Environmental impact among SNV-reachable
+cat("KEY RESULT: ENVIRONMENTAL IMPACT (MERCURY EFFECT)\n")
+cat("Among SNV-reachable substitutions:\n")
+cat(sprintf("  With significant environmental impact: %d / %d (%.2f%%)\n",
+            snv_with_significant_impact, total_snv_reachable, pct_snv_with_impact))
+cat(sprintf("  Without significant impact: %d / %d (%.2f%%)\n",
+            total_snv_reachable - snv_with_significant_impact, total_snv_reachable,
+            100 - pct_snv_with_impact))
+cat("\n")
+
+# Breakdown by delta score direction
+snv_negative_delta <- sum(
+  delta_complete[is_snv_reachable == TRUE & significant == TRUE & deltaScore < 0, .N],
+  na.rm = TRUE
+)
+snv_positive_delta <- sum(
+  delta_complete[is_snv_reachable == TRUE & significant == TRUE & deltaScore > 0, .N],
+  na.rm = TRUE
+)
+
+if (snv_with_significant_impact > 0) {
+  cat("DIRECTIONALITY (among SNV-reachable with impact):\n")
+  cat(sprintf("  Negative delta (reduced function in Hg): %d (%.1f%%)\n",
+              snv_negative_delta, 100 * snv_negative_delta / snv_with_significant_impact))
+  cat(sprintf("  Positive delta (improved function in Hg): %d (%.1f%%)\n",
+              snv_positive_delta, 100 * snv_positive_delta / snv_with_significant_impact))
+  cat("\n")
+}
+
+# Summary box
+cat("=================================================================\n")
+cat(sprintf("SUMMARY:\n"))
+cat(sprintf("  %.2f%% of SNV-accessible amino acid substitutions\n", pct_snv_with_impact))
+cat(sprintf("  show statistically significant environmental impact (mercury)\n"))
+cat("=================================================================\n\n")
+
+# Export detailed results
+results_export <- delta_complete[is_snv_reachable == TRUE, 
+                                 .(hgvs_pro, from_aa, to_aa, position,
+                                   deltaScore, deltaSE, significant)]
+results_export <- results_export[order(position, from_aa, to_aa)]
+
+write.csv(results_export, "~/Desktop/CPOX_SNV_Environmental_Impact.csv", row.names = FALSE)
+cat(sprintf("Detailed results exported to: CPOX_SNV_Environmental_Impact.csv\n"))
+cat(sprintf("  Total SNV-reachable rows: %d\n", nrow(results_export)))
+```
+
+```{r, warning=FALSE, Delta Significance Heatmap}
+# =============================================================================
+# CHUNK 15 — Variant Mercury Responsiveness Heatmap (Variant-Level)
+#
+# Produces a full amino acid x position tile heatmap coloured by variant
+# mercury responsiveness category (improved / neutral / APR / impaired / 
+# Synonymous), derived from Δscore (mercury – baseline) significance.
+# Includes a stacked consensus track above showing the fraction of each
+# category per position.
+#
+# Y-axis order follows the Kyte-Doolittle hydrophobicity scale (AVLIMFYWRHKDESTNQGCP).
+#
+# Synonymous variants are ALWAYS classified and colored as "Synonymous" (yellow),
+# regardless of their deltaScore/deltaSE/significance values. They are exempted
+# from the finite-score filter so they are never silently dropped, and their
+# Impact/color_bin assignment is forced last so no score-based logic can
+# overwrite it.
+# =============================================================================
+
+delta <- read_sheet("Delta Map")
+setDT(delta)
+
+# --- Classify variant type FIRST, before any score-based filtering ---------
+delta[, variant_type := "Missense"]
+delta[grepl("Ter$", hgvs_pro), variant_type := "Nonsense"]
+delta[grepl("=\\)?$", hgvs_pro), variant_type := "Synonymous"]  # matches p.Ala110= and p.(Ala110=)
+delta[, variant_group := variant_type]
+delta[variant_type %in% c("Synonymous", "Nonsense"), variant_group := "Synonymous + Nonsense"]
+
+# --- Finite-score filter, exempting synonymous variants --------------------
+delta <- delta[variant_type == "Synonymous" | (is.finite(deltaScore) & is.finite(deltaSE))]
+
+# --- Baseline map (used only for non-synonymous impact classification) -----
+baseline_map <- read_sheet("Baseline Map")
+setDT(baseline_map)
+setnames(baseline_map, 1:4, c("hgvs_pro", "baseline_score", "se", "df"))
+baseline_map[, baseline_lower := baseline_score + se]
+baseline_map[, baseline_stop  := grepl("Ter$", hgvs_pro)]
+baseline_map[, baseline_syn   := grepl("=\\)?$", hgvs_pro)]
+baseline_map[, baseline_miss  := !(baseline_stop | baseline_syn)]
+baseline_miss_tolerated <- baseline_map[baseline_miss & baseline_lower >= 0.5, hgvs_pro]
+
+# --- Mercury map (variant must have valid mercury score to get a real color) -
+mercury_map <- read_sheet("Mercury Map")
+setDT(mercury_map)
+setnames(mercury_map, 1:4, c("hgvs_pro", "mercury_score", "se", "df"))
+mercury_map[, mercury_stop  := grepl("Ter$", hgvs_pro)]
+mercury_map[, mercury_syn   := grepl("=\\)?$", hgvs_pro)]
+mercury_map[, mercury_miss  := !(mercury_stop | mercury_syn)]
+
+# --- Impact classification --------------------------------------------------
+# Mercury responsiveness is determined by:
+# 1. Variant must have BOTH a valid baseline score AND a valid mercury score
+# 2. If either is missing/non-finite → NA (grey)
+# 3. If both exist: apply delta direction logic
+#    - If significant delta and deltaScore > 0 → improved
+#    - If significant delta and deltaScore < 0 and baseline tolerated → APR
+#    - If significant delta and deltaScore < 0 and baseline NOT tolerated → impaired
+#    - If not significant (or deltaScore ≈ 0) → neutral
+
+delta[, Impact := NA_character_]
+
+in_baseline <- delta$hgvs_pro %in% baseline_map$hgvs_pro
+in_mercury  <- delta$hgvs_pro %in% mercury_map$hgvs_pro
+has_both_maps <- in_baseline & in_mercury
+
+baseline_tolerated <- delta$hgvs_pro %in% baseline_miss_tolerated
+
+# Default for variants in BOTH baseline and mercury: neutral (non-significant or near-zero delta)
+delta[has_both_maps, Impact := "neutral"]
+
+# Significant delta > 0 → improved
+delta[has_both_maps & significant == TRUE & deltaScore > 0, Impact := "improved"]
+
+# Significant delta < 0 with baseline tolerated → APR (altered substrate preference)
+delta[has_both_maps & significant == TRUE & deltaScore < 0 & baseline_tolerated, Impact := "APR"]
+
+# Significant delta < 0 with baseline NOT tolerated → impaired (constitutively deleterious)
+delta[has_both_maps & significant == TRUE & deltaScore < 0 & !baseline_tolerated, Impact := "impaired"]
+
+# Synonymous always wins, applied last, no exceptions
+delta[variant_type == "Synonymous", Impact := "Synonymous"]
+
+# --- Single-letter amino acid lookup (for y-axis labels) -------------------
+aa3to1 <- c(
+  Ala = "A", Arg = "R", Asn = "N", Asp = "D", Cys = "C", Gln = "Q", Glu = "E", Gly = "G",
+  His = "H", Ile = "I", Leu = "L", Lys = "K", Met = "M", Phe = "F", Pro = "P", Ser = "S",
+  Thr = "T", Trp = "W", Tyr = "Y", Val = "V"
+)
+
+# --- Build per-variant heatmap data.frame -----------------------------------
+# Both branches now pull the full 3-letter AA code (positions 3-5)
+heatmap_df <- delta %>%
+  mutate(
+    pos             = as.numeric(str_extract(hgvs_pro, "[0-9]+")),
+    substitution_AA = case_when(
+      variant_type == "Synonymous" ~ aa3to1[str_sub(hgvs_pro, 3, 5)],
+      TRUE                         ~ aa3to1[str_sub(hgvs_pro, -3, -1)]
+    ),
+    color_bin = case_when(
+      variant_type == "Synonymous" ~ "Synonymous",
+      is.na(Impact)                ~ NA_character_,
+      Impact == "improved"         ~ "improved",
+      Impact == "neutral"          ~ "neutral",
+      Impact == "APR"              ~ "APR",
+      Impact == "impaired"         ~ "impaired",
+      TRUE                         ~ NA_character_
+    )
+  )
+
+# --- Y-axis order (Kyte-Doolittle hydrophobicity) ---------------------------
+aa_order <- str_split("AVLIMFYWRHKDESTNQGCP", "", simplify = TRUE)
+
+plot_df <- heatmap_df %>%
+  filter(!is.na(pos) & !is.na(substitution_AA)) %>%
+  mutate(
+    substitution_AA = factor(substitution_AA, levels = rev(aa_order)),
+    color_bin       = factor(color_bin, levels = c("improved", "neutral", "APR", "impaired", "Synonymous"))
+  )
+
+# --- WT self-tile, derived from the reference sequence, not from data ------
+# Met (M) and Trp (W) each have exactly one codon, so a synonymous SNV is
+# biologically impossible for them -- no row will ever match the "=" pattern
+# at those positions, and the self-tile would stay grey forever if we only
+# relied on detecting a synonymous row. Instead, derive the WT residue at
+# each position from the ORIGIN AA embedded in any hgvs_pro entry (missense
+# rows carry this too), then force that (position, WT AA) tile to yellow
+# explicitly. This makes the WT tile independent of whether a synonymous
+# variant was ever actually observed there.
+wt_lookup <- delta %>%
+  filter(!is.na(pos <- as.numeric(str_extract(hgvs_pro, "[0-9]+")))) %>%
+  mutate(
+    pos    = as.numeric(str_extract(hgvs_pro, "[0-9]+")),
+    wt_aa  = aa3to1[str_sub(hgvs_pro, 3, 5)]
+  ) %>%
+  filter(!is.na(wt_aa)) %>%
+  distinct(pos, wt_aa)
+
+wt_tiles <- wt_lookup %>%
+  mutate(substitution_AA = factor(wt_aa, levels = rev(aa_order))) %>%
+  filter(!is.na(substitution_AA)) %>%
+  transmute(pos, substitution_AA, color_bin = factor("Synonymous", levels = levels(plot_df$color_bin)))
+
+# --- Complete the grid: every position x substitution_AA combo gets a tile -
+# Any combo with no row in plot_df (i.e. missing from delta entirely, not
+# just missing baseline data) is filled in here with color_bin = NA, which
+# maps to na.value = "grey80" below. This is what actually makes "lacking
+# EITHER map" produce a visible grey tile, rather than just blank space
+# where ggplot has nothing to draw.
+full_grid <- expand.grid(
+  pos             = seq(min(plot_df$pos, na.rm = TRUE), max(plot_df$pos, na.rm = TRUE)),
+  substitution_AA = factor(rev(aa_order), levels = rev(aa_order))
+)
+
+plot_df <- full_grid %>%
+  left_join(
+    plot_df %>% select(pos, substitution_AA, color_bin),
+    by = c("pos", "substitution_AA")
+  )
+
+# Apply WT override last -- guarantees the self-tile is yellow even for
+# Met/Trp, where no data row could ever satisfy the synonymous detection.
+plot_df <- plot_df %>%
+  rows_update(wt_tiles, by = c("pos", "substitution_AA"), unmatched = "ignore")
+
+# --- Build stacked consensus track (fractional composition per position) ---
+consensus_df <- heatmap_df %>%
+  group_by(pos, color_bin) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(pos) %>%
+  mutate(
+    frac = count / sum(count),
+    ymin = 22 + cumsum(lag(frac, default = 0)),
+    ymax = 22 + cumsum(frac)
+  ) %>%
+  ungroup()
+
+# --- Colors (Synonymous is always yellow) -----------------------------------
+impact_colors <- c(
+  "improved"   = "#DFA6A5",
+  "neutral"    = "#F7F8FD",
+  "APR"        = "#CDEED6",
+  "impaired"   = "#AEBBE6",
+  "Synonymous" = "#FCED98"
+)
+
+heatmap_plot <- ggplot() +
+  # Main heatmap tiles
+  geom_tile(data = plot_df, aes(x = pos, y = substitution_AA, fill = color_bin),
+            width = 1, height = 1) +
+  scale_fill_manual(values = impact_colors, na.value = "grey80") +
+  # Stacked consensus track above the heatmap (y positions 22+)
+  geom_rect(data = consensus_df,
+            aes(xmin = pos - 0.5, xmax = pos + 0.5, ymin = ymin, ymax = ymax, fill = color_bin),
+            inherit.aes = FALSE) +
+  labs(x = "Amino acid position", y = "Substituted residue",
+       title = "CPOX Variant Mercury Responsiveness with Consensus Track") +
+  scale_x_continuous(breaks = seq(1, max(plot_df$pos), by = 5)) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text  = element_text(size = 4),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5))
+
+pdf("~/Desktop/CPOX_variant_mercury_responsiveness.pdf", width = 14, height = 3)
+print(heatmap_plot); dev.off()
+```
+
+
+```{r, warning=FALSE, Balanced Precision vs Recall Curves for Maps}
+# =============================================================================
+# CHUNK 16 — Balanced Precision-Recall Curves (PRC)
+#
+# Evaluates the clinical discriminative performance of:
+#   • CPOX baseline DMS map
+#   • CPOX metal DMS map
+#   • AlphaMissense
+#   • ESM-1v
+#   • VARITY_R
+#
+# Positive class: HCP / HP variants (hereditary coproporphyria / harderoporphyria)
+# Negative class: disease_type == "none" (benign)
+# VUS and conflicting variants are excluded.
+#
+# "Balanced" PRC accounts for class imbalance.
+# DMS scores are negated before PRC (lower score = more pathogenic in DMS convention).
+#
+# Four PRC subsets:
+#   1. All variants
+#   2. Excluding HP (harderoporphyria — atypical severe presentation)
+#   3. Excluding MTS positions (< 110) — these may behave differently
+#   4. Excluding HCP
+#
+# A boxplot of scores by clinical annotation (B/LB vs P/LP) is also produced,
+# with Wilcoxon test between groups for each map.
+# =============================================================================
+
+generate_prc_plots <- function(ref_file, baseline_file, metal_file = NULL) {
+  library(data.table); library(dplyr); library(ggplot2); library(tidyr)
+  
+  # Load and label reference data
+  ref_data <- read_sheet("ReferenceSet") %>%
+    mutate(
+      Pathogenic = case_when(
+        disease_type %in% c("HCP","HP") ~ "pathogenic",
+        disease_type == "none"          ~ "benign",
+        TRUE                            ~ disease_type
+      )
+    )
+  
+  baseline_data <- read_sheet("Baseline Map")
+  colnames(baseline_data)[2] <- "baseline"
+  
+  if (!is.null(metal_file)) {
+    metal_data <- read_sheet("Mercury Map")
+    colnames(metal_data)[2] <- "metal"
+  }
+  
+  complete_dataset <- merge(ref_data, baseline_data, by = "hgvs_pro")
+  if (!is.null(metal_file)) {
+    complete_dataset <- merge(complete_dataset, metal_data, by = "hgvs_pro")
+  } else {
+    complete_dataset$metal <- NA
+  }
+  
+  complete_dataset <- complete_dataset %>%
+    select(hgvs_pro, baseline, AlphaMissense, ESM.1v, VARITY_R, disease_type, metal) %>%
+    mutate(pos = as.numeric(gsub("[^0-9]", "", hgvs_pro)))
+  
+  # Clinical annotation boxplot
+  variant_distribution <- complete_dataset %>%
+    mutate(
+      color       = ifelse(disease_type == "HP", "red", "grey30"),
+      disease_type = case_when(
+        disease_type %in% c("HCP","HP") ~ "P/LP",
+        disease_type == "none"          ~ "B/LB",
+        TRUE                            ~ disease_type
+      )
+    )
+  
+  variant_long <- variant_distribution %>%
+    pivot_longer(cols = c(baseline, metal), names_to = "ScoreType", values_to = "Score")
+  
+  annot_plot <- ggplot(variant_long, aes(x = disease_type, y = Score, fill = ScoreType)) +
+    geom_boxplot(alpha = 0.3, position = position_dodge(width = 0.8), outlier.shape = NA) +
+    geom_jitter(aes(color = color, group = ScoreType), size = 2, alpha = 0.8,
+                position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.8)) +
+    scale_fill_manual(values = c(baseline = "#11EE89", metal = "#EE1176")) +
+    scale_color_identity() +
+    theme_minimal() +
+    xlab("Clinical Annotation") + ylab("Score") +
+    labs(title = "Baseline vs Metal Scores by Clinical Annotation", fill = "Map") +
+    theme(legend.position = "right", axis.text = element_text(size = 12),
+          axis.title = element_text(size = 14))
+  print(annot_plot)
+  
+  # Wilcoxon test: P/LP vs. B/LB for each map
+  for (score_type in c("baseline","metal")) {
+    group_B_LB <- variant_distribution %>% filter(disease_type == "B/LB") %>% pull(all_of(score_type))
+    group_P_LP <- variant_distribution %>% filter(disease_type == "P/LP") %>% pull(all_of(score_type))
+    test_result <- wilcox.test(group_P_LP, group_B_LB, exact = FALSE)
+    median_diff <- median(group_P_LP, na.rm = TRUE) - median(group_B_LB, na.rm = TRUE)
+    cat(sprintf("Score type: %s\nMedian difference (P/LP - B/LB): %.6f\n", score_type, median_diff))
+    if (test_result$p.value < 2.2e-16) {
+      cat("P-value: < 2.2e-16\n\n")
+    } else {
+      cat(sprintf("P-value: %.8f\n\n", test_result$p.value))
+    }
+  }
+  
+  # Prepare PRC dataset: negate scores (lower DMS score = more pathogenic)
+  PRC_data <- complete_dataset %>%
+    filter(
+      !grepl("VUS",        disease_type, ignore.case = TRUE) &
+      !grepl("conflicting",disease_type, ignore.case = TRUE)
+    ) %>%
+    mutate(
+      Pathogenic = case_when(
+        disease_type %in% c("HCP","HP") ~ TRUE,
+        disease_type == "none"          ~ FALSE,
+        TRUE                            ~ FALSE
+      ),
+      baseline = -baseline,
+      metal    = ifelse(!is.na(metal), -metal, NA)
+    )
+  print(PRC_data)
+  
+  # PRC plotting helper using yogiroc
+  plot_prc <- function(data, title) {
+    prc_data <- data %>%
+      select(Pathogenic, baseline, AlphaMissense, ESM.1v, VARITY_R, metal) %>%
+      mutate(Pathogenic = as.logical(Pathogenic))
+    
+    if (all(is.na(prc_data$metal))) {
+      prc_data <- prc_data %>% select(-metal)
+      colors   <- c("#11EE89","#D02F43","#2FD0BC","black")
+    } else {
+      colors   <- c("#11EE89","#D02F43","#2FD0BC","black","#EE1176")
+    }
+    
+    yrobj <- yr2(truth = prc_data$Pathogenic, scores = prc_data[, -1])
+    draw.prc(yrobj, balanced = TRUE, main = title, col = colors)
+    cat("Total Pathogenic (TRUE) and Benign (FALSE):\n")
+    print(table(prc_data$Pathogenic))
+  }
+  
+  # Generate all PRC subsets
+  plot_prc(PRC_data, "All Variants")
+  plot_prc(PRC_data %>% filter(!grepl("HP",  disease_type, ignore.case = TRUE)), "Excluding HP Variants")
+  plot_prc(PRC_data %>% filter(as.numeric(gsub("[^0-9]","",hgvs_pro)) >= 110),   "Excluding MTS Positions (2-110)")
+  plot_prc(PRC_data %>% filter(!grepl("HCP", disease_type, ignore.case = TRUE)), "Excluding HCP Variants")
+  
+  # Save PDFs
+  pdf("~/Desktop/All_PRC.pdf", width = 8, height = 6)
+  plot_prc(PRC_data, "All Variants")
+  ggsave("~/Desktop/All_ClinicalVariants.pdf", plot = annot_plot, width = 8, height = 6)
+  dev.off()
+  pdf("~/Desktop/PRC_noHP.pdf",  8, 6)
+  plot_prc(PRC_data %>% filter(!grepl("HP",  disease_type, ignore.case = TRUE)), "Excluding HP Variants"); dev.off()
+  pdf("~/Desktop/PRC_noHCP.pdf", 8, 6)
+  plot_prc(PRC_data %>% filter(!grepl("HCP", disease_type, ignore.case = TRUE)), "Excluding HCP Variants"); dev.off()
+  pdf("~/Desktop/PRC_noMTS.pdf", 8, 6)
+  plot_prc(PRC_data %>% filter(as.numeric(gsub("[^0-9]","",hgvs_pro)) >= 110),   "Excluding MTS Positions (2-110)"); dev.off()
+}
+
+generate_prc_plots(
+  ref_file      = "~/Desktop/Manuscript_Data.xlsx",
+  baseline_file = "~/Desktop/Manuscript_Data.xlsx",
+  metal_file    = "~/Desktop/Manuscript_Data.xlsx"
+)
+```
+
+
+```{r, Balanced Precision vs Recall Curve for Random Predictor, warning=FALSE}
+# =============================================================================
+# CHUNK 17 — PRC with Random Predictor
+#
+# Adds a random predictor (shuffled truth labels) to the PRC to provide a
+# chance-level baseline. This confirms that the observed PRC area under the
+# curve exceeds random performance.
+# seed = 123 ensures reproducibility of the random shuffle.
+# =============================================================================
+
+library(data.table); library(dplyr); library(ggplot2); library(tidyr); library(yogiroc)
+
+generate_prc_plots <- function(ref_file, baseline_file, metal_file = NULL) {
+  
+  ref_data <- read_sheet("ReferenceSet")
+  
+  baseline_data <- read_sheet("Baseline Map")
+  colnames(baseline_data)[2] <- "baseline"
+  
+  if (!is.null(metal_file)) {
+    metal_data <- read_sheet("Mercury Map")
+    colnames(metal_data)[2] <- "metal"
+  }
+  
+  complete_dataset <- merge(ref_data, baseline_data, by = "hgvs_pro")
+  if (!is.null(metal_file)) {
+    complete_dataset <- merge(complete_dataset, metal_data, by = "hgvs_pro")
+  } else {
+    complete_dataset$metal <- NA
+  }
+  
+  # Prepare PRC data (negate scores, filter VUS/conflicting)
+  PRC_data <- complete_dataset %>%
+    filter(
+      !grepl("VUS",         disease_type, ignore.case = TRUE) &
+      !grepl("conflicting", disease_type, ignore.case = TRUE)
+    ) %>%
+    mutate(
+      Pathogenic = case_when(
+        disease_type %in% c("HCP","HP") ~ TRUE,
+        disease_type == "none"          ~ FALSE,
+        TRUE                            ~ FALSE
+      ),
+      baseline = -baseline,
+      metal    = ifelse(!is.na(metal), -metal, NA)
+    ) %>%
+    select(hgvs_pro, Pathogenic, baseline, AlphaMissense, ESM.1v, VARITY_R, metal)
+  
+  # Add random predictor: shuffled pathogenicity labels (set.seed for reproducibility)
+  set.seed(123)
+  PRC_data$Random <- -1 * as.numeric(sample(PRC_data$Pathogenic))
+  
+  cat("\n===== PRC DATA TABLE USED =====\n")
+  print(PRC_data)
+  cat("\nPathogenic counts:\n")
+  print(table(PRC_data$Pathogenic))
+  
+  score_matrix <- PRC_data %>%
+    select(baseline, AlphaMissense, ESM.1v, VARITY_R, metal, Random)
+  
+  colors <- c(
+    "#11EE89",  # baseline
+    "#D02F43",  # AlphaMissense
+    "#2FD0BC",  # ESM.1v
+    "black",    # VARITY_R
+    "#EE1176",  # metal
+    "grey50"    # Random
+  )
+  
+  yrobj <- yr2(truth = PRC_data$Pathogenic, scores = score_matrix)
+  
+  pdf("~/Desktop/PRC_Random.pdf", width = 8, height = 6)
+  draw.prc(yrobj, balanced = TRUE, main = "All Variants (Random Included)", col = colors)
+  dev.off()
+  
+  cat("\nPRC figure saved to ~/Desktop/PRC_Random.pdf\n")
+}
+
+generate_prc_plots(
+  ref_file      = "~/Desktop/Manuscript_Data.xlsx",
+  baseline_file = "~/Desktop/Manuscript_Data.xlsx",
+  metal_file    = "~/Desktop/Manuscript_Data.xlsx"
+)
+```
+
+
+```{r, warning=FALSE, LLRp}
+# =============================================================================
+# CHUNK 18 — LLRp Evidence for VUS Reclassification
+#
+# Applies the Tavtigian et al. (2020) log-likelihood ratio (LLR) framework
+# to quantify functional evidence strength for CPOX ClinVar VUS variants.
+#
+# LLR thresholds (ACMG/AMP evidence levels):
+#   > 1.2723   : pathogenic very strong
+#   0.636–1.272: pathogenic moderate
+#   0.318–0.636: pathogenic supporting
+#  -0.318–0.318: no evidence
+#  -1.272–-0.318: benign supporting
+#   < -1.272   : benign strong
+#
+# A stacked bar chart shows the evidence distribution per ClinVar category
+# (P/LP, B/BP, VUS). Percentage of VUS with actionable evidence is reported.
+# =============================================================================
+
+LLRp_data <- read_sheet("LLRp Scores")
+
+# Assign ACMG evidence categories based on LLR thresholds
+LLRp_data$category <- dplyr::case_when(
+  LLRp_data$llr >  0.636167   & LLRp_data$llr <  1.2723233 ~ "patho_moderate",
+  LLRp_data$llr >  0.3180808  & LLRp_data$llr <  0.636167  ~ "patho_support",
+  LLRp_data$llr <  0.3180808  & LLRp_data$llr > -0.3180808 ~ "none",
+  LLRp_data$llr > -1.2723233  & LLRp_data$llr < -0.3180808 ~ "benign_support",
+  LLRp_data$llr < -1.2723233                                ~ "benign_strong",
+  TRUE                                                       ~ "patho_vstrong"
+)
+
+# Load and classify reference variants
+ref_Set <- read_sheet("ReferenceSet")
+ref_Set <- ref_Set %>%
+  mutate(
+    clinvar = case_when(
+      grepl("HP|HCP", disease_type, ignore.case = TRUE) ~ "P/LP",
+      grepl("none",   disease_type, ignore.case = TRUE) ~ "B/BP",
+      TRUE                                              ~ "VUS"
+    )
+  )
+
+new_evidence_data <- merge(LLRp_data, ref_Set, by = "hgvs_pro")
+new_evidence_data <- new_evidence_data[, c("hgvs_pro","clinvar","llr","category")]
+
+# Colour scheme: green (benign) → grey (none) → purple (pathogenic)
+category_colors <- c(
+  "benign_strong"  = "#50DD22",
+  "benign_support" = "#A0FF80",
+  "none"           = "grey50",
+  "patho_support"  = "#D18BEE",
+  "patho_moderate" = "#AF22DD",
+  "patho_strong"   = "#9B00C8",
+  "patho_vstrong"  = "#8000A0"
+)
+
+LLR_evidence <- ggplot(new_evidence_data, aes(x = clinvar, fill = category)) +
+  geom_bar(position = position_stack(reverse = TRUE)) +
+  scale_fill_manual(values = category_colors) +
+  theme_minimal() +
+  labs(x = "ClinVar Category", y = "Count", fill = "LLR Category") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(filename = "~/Desktop/LLR_evidence.pdf", plot = LLR_evidence, width = 8, height = 6)
+
+# Percentage of VUS with any functional evidence (i.e. category ≠ "none")
+vus_data          <- new_evidence_data[new_evidence_data$clinvar == "VUS", ]
+total_vus         <- nrow(vus_data)
+vus_with_none     <- nrow(vus_data[vus_data$category == "none", ])
+vus_without_none  <- ((total_vus - vus_with_none) / total_vus) * 100
+
+cat("Percentage of VUS entries without 'none' in category:", vus_without_none, "%\n")
+```
+
+
+```{r, warning=FALSE, VUS Numbers}
+# =============================================================================
+# CHUNK 19 — VUS Reclassification Summary
+#
+# Breaks down the functional evidence categories for the VUS subset.
+# Reports counts and percentages (calculated excluding "none" from denominator
+# to show the distribution among those with actual evidence).
+# =============================================================================
+
+# Counts per category for VUS variants
+category_counts <- table(vus_data$category)
+
+# Exclude "none" for percentage calculation (report among actionable evidence only)
+categories_for_percentage <- category_counts[names(category_counts) != "none"]
+
+category_percentages <- (categories_for_percentage / sum(categories_for_percentage)) * 100
+
+category_summary <- data.frame(
+  Category   = names(categories_for_percentage),
+  Count      = as.vector(categories_for_percentage),
+  Percentage = as.vector(category_percentages)
+)
+
+cat("Counts and Percentages of VUS entries by category (excluding 'none' from percentage):\n")
+print(category_summary)
+```
+
+
+```{r, warning=FALSE, Variant Validation}
+# =============================================================================
+# CHUNK 20 — Variant Validation (Growth Curves)
+#
+# Analyses yeast growth curves from a 96-well plate reader experiment used
+# to orthogonally validate a subset of DMS variants.
+#
+# Data source: 'Growth Curves Summary' sheet in Manuscript_Data.xlsx
+#   Dataset='WT_N272'    : WT vs p.Asn272His across five mercury concentrations
+#   Dataset='0 vs 96 µM' : WT, p.Asn272His, p.Leu155Trp, p.Gly188Gln at 0 and 96 µM
+#
+# Condition and Comparison columns are mercury concentrations in µM.
+#
+# Output: mean ± SD growth curves (linear and log scale) with ribbon shading.
+# =============================================================================
+
+DATA_PATH     <- "~/Desktop/Manuscript_Data.xlsx"
+output_prefix <- "~/Desktop/CPOX_Growth_Curves"
+
+# ── Read data ─────────────────────────────────────────────────────────────
+gc <- read_excel(DATA_PATH, sheet = "Growth Curves Summary", skip = 1) %>%
+  mutate(Time_hours = as.numeric(Time_hours))
+
+df_summary <- gc %>%
+  filter(Dataset == "WT_N272") %>%
+  mutate(
+    Variant    = factor(Variant, levels = c("WT", "N272")),
+    Condition  = factor(Condition),
+    Comparison = as.numeric(Comparison)
+  )
+
+df_AD <- gc %>%
+  filter(Dataset == "0 vs 96 µM") %>%
+  mutate(
+    Variant   = factor(Variant, levels = unique(Variant)),
+    Condition = factor(Condition)
+  )
+
+# ── Loop over comparison concentrations (WT_N272 dataset) ─────────────────
+comparison_rows  <- unique(df_summary$Comparison)
+plot_list_linear <- list()
+plot_list_log    <- list()
+
+for (comparison_conc in comparison_rows) {
+
+  df_plot <- df_summary %>% filter(Comparison == comparison_conc)
+
+  linetype_values <- setNames(c("dotted", "solid"), unique(as.character(df_plot$Condition)))
+  color_values    <- RColorBrewer::brewer.pal(4, "Set1")[1:2]
+  plot_key        <- paste0(comparison_conc, "uM")
+
+  p_linear <- ggplot(df_plot, aes(Time_hours, mean_OD, color = Variant, linetype = Condition)) +
+    geom_line(size = 1, aes(group = interaction(Variant, Condition))) +
+    geom_ribbon(aes(ymin = mean_OD - sd_OD, ymax = mean_OD + sd_OD, fill = Variant),
+                alpha = 0.15, color = NA) +
+    scale_linetype_manual(values = linetype_values) +
+    scale_color_manual(values = color_values) +
+    scale_fill_manual(values = color_values) +
+    labs(title = paste0("Growth Curves (Linear) — 0 vs ", comparison_conc, " µM"),
+         x = "Time (hours)", y = "OD600") +
+    theme_minimal()
+
+  p_log <- ggplot(df_plot, aes(Time_hours, mean_OD, color = Variant, linetype = Condition)) +
+    geom_line(size = 1, aes(group = interaction(Variant, Condition))) +
+    geom_ribbon(aes(ymin = mean_OD - sd_OD, ymax = mean_OD + sd_OD, fill = Variant),
+                alpha = 0.15, color = NA) +
+    scale_linetype_manual(values = linetype_values) +
+    scale_y_log10() +
+    scale_color_manual(values = color_values) +
+    scale_fill_manual(values = color_values) +
+    labs(title = paste0("Growth Curves (Log scale) — 0 vs ", comparison_conc, " µM"),
+         x = "Time (hours)", y = "OD600 (log scale)") +
+    theme_minimal()
+
+  ggsave(paste0(output_prefix, "_", plot_key, "_Linear.pdf"), p_linear, width = 8, height = 6)
+  ggsave(paste0(output_prefix, "_", plot_key, "_Log.pdf"),    p_log,    width = 8, height = 6)
+
+  plot_list_linear[[plot_key]] <- p_linear
+  plot_list_log[[plot_key]]    <- p_log
+}
+
+# ── 0 vs 96 µM plot (all variants) ────────────────────────────────────────
+linetype_values_AD <- setNames(c("dotted", "solid"), levels(df_AD$Condition))
+color_values_AD    <- RColorBrewer::brewer.pal(4, "Set1")[1:length(unique(df_AD$Variant))]
+
+p_AD_linear <- ggplot(df_AD, aes(Time_hours, mean_OD, color = Variant, linetype = Condition)) +
+  geom_line(size = 1, aes(group = interaction(Variant, Condition))) +
+  geom_ribbon(aes(ymin = mean_OD - sd_OD, ymax = mean_OD + sd_OD, fill = Variant),
+              alpha = 0.15, color = NA) +
+  scale_linetype_manual(values = linetype_values_AD) +
+  scale_color_manual(values = color_values_AD) +
+  scale_fill_manual(values = color_values_AD) +
+  labs(title = "Growth Curves (Linear) — 0 vs 96 µM (All Variants)",
+       x = "Time (hours)", y = "OD600") +
+  theme_minimal()
+
+p_AD_log <- ggplot(df_AD, aes(Time_hours, mean_OD, color = Variant, linetype = Condition)) +
+  geom_line(size = 1, aes(group = interaction(Variant, Condition))) +
+  geom_ribbon(aes(ymin = mean_OD - sd_OD, ymax = mean_OD + sd_OD, fill = Variant),
+              alpha = 0.15, color = NA) +
+  scale_linetype_manual(values = linetype_values_AD) +
+  scale_y_log10() +
+  scale_color_manual(values = color_values_AD) +
+  scale_fill_manual(values = color_values_AD) +
+  labs(title = "Growth Curves (Log scale) — 0 vs 96 µM (All Variants)",
+       x = "Time (hours)", y = "OD600 (log scale)") +
+  theme_minimal()
+
+plot_list_linear[["0_vs_96uM_all"]] <- p_AD_linear
+plot_list_log[["0_vs_96uM_all"]]    <- p_AD_log
+
+# ── Combined grid ─────────────────────────────────────────────────────────
+combined_linear <- wrap_plots(plot_list_linear, ncol = 3)
+combined_log    <- wrap_plots(plot_list_log,    ncol = 3)
+
+ggsave(paste0(output_prefix, "_Combined_Linear.pdf"), combined_linear, width = 16, height = 8)
+ggsave(paste0(output_prefix, "_Combined_Log.pdf"),    combined_log,    width = 16, height = 8)
+```
